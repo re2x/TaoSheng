@@ -1,5 +1,9 @@
 package app.resound.transcribe.local
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.capture.CaptureTuning
+
 import android.content.*
 import android.os.*
 import app.resound.transcribe.*
@@ -31,6 +35,11 @@ internal class LocalAsrConnection(private val context:Context) {
             if(data.containsKey(part.name)) request.timings?.add(part,data.getLong(part.name))
         }
         when(message.what){
+            8 -> {
+                val reason=data.getString("reason")?.takeIf { it in setOf("resume-start","progress-corrupt","progress-invalidated","progress-read-failed") } ?: "other"
+                val segment=data.getString("segment")?.takeIf { it.matches(Regex("(segment:[0-9]+|audio:[a-f0-9]{64})")) } ?: "unknown"
+                PipelineTimes.record(context,"192续转 id=$segment 原因=$reason 总块=${data.getInt("total")} 起始块=${data.getInt("done")+1} 已完成=${data.getInt("done")}")
+            }
             // 分人进度的数字是模型内部的分析窗口数，不是人数：显示成百分比，并注明分人始终在 CPU 上跑
             2->{
                 val done=data.getInt("done");val total=data.getInt("total").coerceAtLeast(1)
@@ -41,11 +50,15 @@ internal class LocalAsrConnection(private val context:Context) {
             6->request.started.complete(Unit)
             3->{
                 runCatching {
-                    val texts=data.getStringArrayList("texts").orEmpty();val starts=requireNotNull(data.getLongArray("starts"));val ends=requireNotNull(data.getLongArray("ends"));val tags=data.getStringArrayList("tags")
+                    val texts=data.getStringArrayList("texts").orEmpty();val starts=requireNotNull(data.getLongArray("starts"));val ends=requireNotNull(data.getLongArray(
+                        "ends"));val tags=data.getStringArrayList("tags")
                     check(texts.size==starts.size && starts.size==ends.size)
                     val result=AsrResult(texts.mapIndexed{i,text->AsrSentence(starts[i],ends[i],text,tags?.getOrNull(i)?.takeIf{it.isNotBlank()})},data.getLong("duration"),null)
-                    lastMetrics=Metrics(data.getInt("pid"),data.getInt("loads"),data.getInt("timedChunks"),data.getInt("chunks"),data.getString("language") ?: "auto",data.getStringArrayList("detectedLanguages").orEmpty())
+                    lastMetrics=Metrics(data.getInt("pid"),data.getInt("loads"),data.getInt("timedChunks"),data.getInt("chunks"),data.getString("language") ?: "auto",data
+                        .getStringArrayList("detectedLanguages").orEmpty())
                     request.result.complete(result)
+                }.onFailure {
+                    FailureNotes.record("transcribe/local/LocalAsrConnection.kt:45", it)
                 }.onFailure{request.result.completeExceptionally(AsrException(AsrError.Protocol))}
                 request.started.complete(Unit)
             }
@@ -72,12 +85,14 @@ internal class LocalAsrConnection(private val context:Context) {
         diagnostic("local-binding-lost")
         death.complete(Unit)
         binding?.completeExceptionally(AsrException(AsrError.LocalEngine))
-        for(request in pending.values){request.started.complete(Unit);request.result.completeExceptionally(AsrException(AsrError.LocalEngine))}
+        for(request in pending.values){request.started.complete(Unit);request.result.completeExceptionally(AsrException(AsrError.LocalEngine, detail = "local-unbound"))}
         disconnect()
     }
     private fun disconnect() {
         idle?.cancel();idle=null
-        if(bound){closing=death;runCatching{context.unbindService(connection!!)};diagnostic("local-unbound")}
+        if(bound){closing=death;runCatching{
+            // 仅释放/清除临时资源；失败不改变已确定的业务结果，可忽略。
+            context.unbindService(connection!!)};diagnostic("local-unbound")}
         bound=false;connection=null;binding=null
     }
     private suspend fun connect():Messenger {
@@ -90,7 +105,9 @@ internal class LocalAsrConnection(private val context:Context) {
             override fun onServiceConnected(name:ComponentName,binder:IBinder){
                 if(binding!==ready)return
                 try {binder.linkToDeath({scope.launch{generation.complete(Unit);if(binding===ready)broken()}},0);ready.complete(Messenger(binder))}
-                catch(_:Exception){broken()}
+                catch(caught:Exception){
+                    FailureNotes.record("transcribe/local/LocalAsrConnection.kt:97", caught)
+                   broken()}
             }
             override fun onServiceDisconnected(name:ComponentName){if(binding===ready)broken()}
             override fun onBindingDied(name:ComponentName){if(binding===ready)broken()}
@@ -117,13 +134,17 @@ internal class LocalAsrConnection(private val context:Context) {
         var messenger:Messenger?=null
         try {
             messenger=connect()
-            messenger.send(Message.obtain(null,1).apply{replyTo=receiver;data=Bundle().apply{putString("id",id);putString("path",audio.file.path);putString("pcmPath",audio.pcmFile?.path);putString("backend",backend.name);putString("language",language.code);putBoolean("separateSpeakers",audio.separateSpeakers);putInt("speakerCount", audio.speakerCount ?: -1);putLong("timeoutMillis",InferenceWakeLock.timeoutMillis(audio.durationMillis))}})
+            messenger.send(Message.obtain(null,1).apply{replyTo=receiver;data=Bundle().apply{putString("id",id);putString("segment", request.timings?.segmentId?.let { "segment:$it" } ?: "audio:${LocalResumeFiles.hash(audio.file.path.toByteArray())}");putString("hotwords", currentCoroutineContext()[LocalResumeRequest]?.hotwords ?: "");putString("path",audio.file.path);putString("pcmPath",
+                audio.pcmFile?.path);putString("backend",backend.name);putString("language",language.code);putBoolean("separateSpeakers",audio.separateSpeakers);putInt(
+                "speakerCount", audio.speakerCount ?: -1);putLong("timeoutMillis",InferenceWakeLock.timeoutMillis(audio.durationMillis))}})
             // 排队期间不消耗模型执行超时，调用方取消仍会立即生效。
             request.started.await()
             try { withTimeout(InferenceWakeLock.timeoutMillis(audio.durationMillis)){request.result.await()} }
-            catch(e:TimeoutCancellationException){diagnostic("local-inference-timeout");throw e}
+            catch(e:TimeoutCancellationException){diagnostic("local-inference-timeout");throw AsrException(AsrError.Interrupted, detail = "local-inference-timeout")}
         } finally {
-            if(!request.result.isCompleted)runCatching{messenger?.send(Message.obtain(null,7).apply{data=Bundle().apply{putString("id",id)}})}
+            if(!request.result.isCompleted)runCatching{
+                // 仅释放/清除临时资源；失败不改变已确定的业务结果，可忽略。
+                messenger?.send(Message.obtain(null,7).apply{data=Bundle().apply{putString("id",id)}})}
             pending.remove(id)
             if(pending.isEmpty())idle=scope.launch{delay(IDLE_MILLIS);if(pending.isEmpty())disconnect()}
         }
@@ -132,7 +153,7 @@ internal class LocalAsrConnection(private val context:Context) {
         // API 14 起支持；继承主进程（包括录音前台服务）的优先级，不额外申请传感器能力。
         internal const val BIND_FLAGS = Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
         /** 比一段录音最长 5 分钟多 1 分钟：一直有人说话时模型常驻、录完就转不用反复加载；安静下来才退出省内存 */
-        val IDLE_MILLIS = app.resound.capture.CaptureTuning.MAX_SEGMENT_SAMPLES * 1000L / app.resound.capture.CaptureTuning.SAMPLE_RATE + 60_000L
+        val IDLE_MILLIS = CaptureTuning.MAX_SEGMENT_SAMPLES * 1000L / CaptureTuning.SAMPLE_RATE + 60_000L
         private val instances=mutableMapOf<String,LocalAsrConnection>()
         @Synchronized fun get(context:Context)=instances.getOrPut(context.packageName){LocalAsrConnection(context.applicationContext)}
     }

@@ -1,5 +1,6 @@
 package app.resound.skills
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -26,9 +27,11 @@ import java.time.LocalDate
 @Config(sdk = [29], manifest = Config.NONE, application = Application::class)
 @SQLiteMode(SQLiteMode.Mode.NATIVE)
 class Skills031Test {
+ @org.junit.Before fun zone200Fixture() { app.resound.platform.HistoricalZones.history = { app.resound.platform.ZoneHistory(emptyList(), "Asia/Shanghai") } }
+ @org.junit.After fun reset200Zone() { app.resound.platform.HistoricalZones.history = { app.resound.platform.ZoneHistory(emptyList(), kotlinx.datetime.TimeZone.currentSystemDefault().id) } }
     private val context: Context get() = RuntimeEnvironment.getApplication()
     private val day = LocalDate.parse("2026-10-23")
-    private val start = day.atStartOfDay(SKILL_ZONE).toInstant().toEpochMilli()
+    private val start = day.atStartOfDay(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
     private var clock = start + 22 * 3_600_000L
     private lateinit var db: CaptureDatabase
     private lateinit var root: File
@@ -41,12 +44,13 @@ class Skills031Test {
     private var response: suspend (String, String) -> LlmReply = { _, _ -> LlmReply("""{"cards":[],"nothing_reason":"没有会议"}""", 10, 2) }
     private fun official() = File("src/main/assets/skills").listFiles()!!.map { dir ->
         val d = SkillJson.parse(File(dir, "skill.json").readText(), SkillOrigin.Builtin)
-        d.copy(skill = d.skill.copy(version = version)) to File(dir, "prompt.md").readText()
+        // 本组验证原有调度/存储规则，沿用无门槛样本；官方门槛由 SkillGate146Test 使用真实 assets 验证。
+        d.copy(skill = d.skill.copy(version = version, gate = null), gateSpecified = false) to File(dir, "prompt.md").readText()
     }
     @Before fun setup() {
         root = File(context.cacheDir, "skills031").apply { deleteRecursively(); mkdirs() }
         files = SkillFiles(root, ::official)
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
     @After fun teardown() { scope.cancel(); db.close(); root.deleteRecursively() }
@@ -56,14 +60,14 @@ class Skills031Test {
             override suspend fun send(title: String, body: String, deepLink: String?, topic: PushTopic?) {
                 assertEquals(PushTopic.SkillCard, topic); assertTrue(deepLink!!.startsWith("resound://card?open=card&id=")); sent += title
             }
-        }, { _, _ -> }, { clock })
+        }, { _, _ -> }, { clock }, io = kotlinx.coroutines.Dispatchers.IO)
     private fun skill(id: String = "meeting") = files.skills.value.first { it.id == id }
     private fun line(id: Long, who: String?, text: String = "我来推进项目", at: Long = start + 36_000_000) =
         TranscriptLineEntity(id, 1, at, at + 2000, text, null, who, 1, start + 38_000_000)
     private suspend fun seed() {
         db.capture().segment(SegmentEntity(1, start + 36_000_000, start + 37_000_000, "mic", "/unused", 0, "Done"))
         db.memory().insertEvent(MemoryEventEntity(1, start + 36_000_000, start + 37_000_000, "会议", "项目会议", "讨论项目推进", "[]", "[]", null, null, null, false, false, start + 38_000_000, "test"))
-        val sql = db.openHelper.writableDatabase
+        val sql = db.testSql
         sql.execSQL("INSERT INTO transcript_lines(id,segmentId,startAt,endAt,text,speakerName,eventId,digestedAt,speakerManual) VALUES(1,1,?,?, '我来推进项目','我',1,?,0)", arrayOf(start + 36_000_000, start + 36_002_000, start + 38_000_000))
         sql.execSQL("INSERT INTO transcript_lines(id,segmentId,startAt,endAt,text,speakerName,eventId,digestedAt,speakerManual) VALUES(2,1,?,?, '我负责预算','小王',1,?,0)", arrayOf(start + 36_900_000, start + 36_902_000, start + 38_000_000))
     }
@@ -141,7 +145,7 @@ class Skills031Test {
         db.skills().delete(joined.id, clock)
         assertNull(db.skills().merge(card("second", "16:00", "16:30"), 8))
     }
-    @Test fun quotesAreRefilledAndUnknownEvidenceAndEmptyRequiredAreDiscarded() {
+    @Test fun quotesAreRefilledAndUnknownEvidenceAndEmptyRequiredAreDiscarded() = kotlinx.coroutines.runBlocking {
         val input = SkillInput("", mapOf("L1" to line(42, "小王", "我负责预算")))
         val content = """{"cards":[{"entity":"a","title":"讨论","summary":"预算","at":"10:00","end":null,"values":{"topic":"项目","conclusion":"小王负责预算","quotes":["L1","L999",{"text":"伪造原文","lineId":42}]},"evidence":["L1","L999",42]},{"entity":"b","title":"空","at":"10:00","values":{"topic":"   "}}]}"""
         val rows = SkillOutput.parse(content, skill(), day, input, clock, true).rows
@@ -154,7 +158,7 @@ class Skills031Test {
         assertEquals(due, SkillSchedule.next(s, emptyList(), start))
         assertEquals(clock, SkillSchedule.next(s, emptyList(), clock))
         assertEquals(due + 86_400_000, SkillSchedule.next(s, emptyList(), clock, catchUp = false))
-        assertEquals(day.plusDays(2).atTime(21, 0).atZone(SKILL_ZONE).toInstant().toEpochMilli(), SkillSchedule.next(skill("weekly"), emptyList(), clock))
+        assertEquals(day.plusDays(2).atTime(21, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli(), SkillSchedule.next(skill("weekly"), emptyList(), clock))
         val yesterday = SkillRunRow(skillId = s.id, date = day.minusDays(1).toEpochDay(), at = start - 1, ok = false, result = "网络", tokens = 0, kind = SkillSchedule.DAILY, retryable = true)
         assertEquals(clock, SkillSchedule.next(s, listOf(yesterday), clock))
         val failure = yesterday.copy(date = day.toEpochDay(), at = clock)
@@ -177,7 +181,7 @@ class Skills031Test {
     }
     @Test fun migrationElevenToTwelvePreservesExistingTablesAndRoomValidates() = runBlocking {
         val name = "skills-migration.db"; context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/11.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/11.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             schema.getJSONArray("entities").elements().forEach { raw ->
                 val e = raw as JSONObject
@@ -190,7 +194,7 @@ class Skills031Test {
         }
         val migrated = CaptureDatabase.open(context, name)
         try {
-            assertEquals(app.resound.data.CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(app.resound.data.CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals(12L, migrated.memory().observeUsage().first().single().promptTokens)
             assertNotNull(migrated.skills().merge(card(), 8)); assertEquals(1, migrated.skills().cards(day.toEpochDay()).first().size)
         } finally { migrated.close(); context.deleteDatabase(name) }
@@ -266,7 +270,7 @@ class Skills031Test {
         }
         val copy = CaptureDatabase.open(context, path)
         try {
-            assertEquals(app.resound.data.CaptureDatabase.VERSION, copy.openHelper.writableDatabase.version)
+            assertEquals(app.resound.data.CaptureDatabase.VERSION, copy.testSql.version)
             for (s in skillsForProbe()) {
                 val input = SkillInputs.load(copy.skills(), s, day, null, start + 86_399_999)
                 val json = JSONObject().put("skillId", s.id).put("date", day.toString())

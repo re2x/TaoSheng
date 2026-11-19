@@ -1,6 +1,8 @@
 package app.resound.ui.verify
 
 import androidx.compose.foundation.background
+import app.resound.ui.theme.fade
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,8 +43,8 @@ enum class ActionKind { Primary, Secondary, Danger }
 fun ActionButton(text: String, kind: ActionKind, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
     val c = Rs.colors
     val (bg, fg) = when (kind) {
-        ActionKind.Primary -> c.accent to Color.White
-        ActionKind.Secondary -> c.background to c.text
+        ActionKind.Primary -> c.primary to c.onPrimary
+        ActionKind.Secondary -> c.fill to c.text
         ActionKind.Danger -> c.critical.copy(alpha = 0.1f) to c.critical
     }
     Box(
@@ -72,21 +74,28 @@ private val KeepUpwardScroll = object : androidx.compose.ui.input.nestedscroll.N
 fun RsSheet(title: String, subtitle: String? = null, onDismiss: () -> Unit,
             /** 内容会随选择变长变短的面板设为 true：固定高度，避免高度突变时系统误判成下滑关闭 */
             fixedHeight: Boolean = false,
+            scrollState: androidx.compose.foundation.ScrollState? = null,
+            /** 标题行右侧（如“⋯”更多菜单） */
+            trailing: (@Composable () -> Unit)? = null,
             content: @Composable ColumnScope.() -> Unit) {
     val c = Rs.colors
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
-        containerColor = c.card,
-        dragHandle = { Box(Modifier.padding(vertical = 10.dp).size(width = 36.dp, height = 5.dp).clip(CircleShape).background(c.separator)) },
+        containerColor = c.elevated,
+        dragHandle = { Box(Modifier.padding(vertical = 10.dp).size(width = 36.dp, height = 5.dp).clip(CircleShape).background(if (c.isDark) c.textTertiary.fade(0.35f) else c.separator)) },
     ) {
         Column(
             Modifier.then(if (fixedHeight) Modifier.fillMaxHeight(0.92f) else Modifier)
                 .nestedScroll(KeepUpwardScroll)
-                .verticalScroll(rememberScrollState()).imePadding().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+                .verticalScroll(scrollState ?: rememberScrollState()).imePadding().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(title, style = RsType.title, color = c.text)
+            if (trailing == null) Text(title, style = RsType.title, color = c.text)
+            else Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = RsType.title, color = c.text, modifier = Modifier.weight(1f))
+                trailing()
+            }
             subtitle?.let { Text(it, style = RsType.subhead, color = c.textSecondary) }
             Spacer(Modifier.height(2.dp))
             content()
@@ -101,7 +110,7 @@ fun SheetInput(value: String, hint: String, wrap: Boolean = false, onChange: (St
     // wrap：长内容自动折行显示（最多 6 行，再长可滚动）；仍是一段话，回车不插入换行
     BasicTextField(
         value, if (wrap) { v -> onChange(v.replace("\n", "")) } else onChange, singleLine = !wrap, maxLines = if (wrap) 6 else 1, textStyle = RsType.body.copy(color = c.text), cursorBrush = SolidColor(c.accent),
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(horizontal = 16.dp, vertical = 14.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(horizontal = 16.dp, vertical = 14.dp),
         decorationBox = { inner -> Box { if (value.isEmpty()) Text(hint, style = RsType.body, color = c.textTertiary); inner() } },
     )
 }

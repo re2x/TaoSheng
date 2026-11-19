@@ -1,5 +1,6 @@
 package app.resound.ui.ask
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.LinearEasing
@@ -42,7 +43,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,10 +84,10 @@ import java.time.format.DateTimeFormatter
 fun AskScreen(repo: AskRepository, bottomPadding: Dp) {
     var showHistory by remember { mutableStateOf(false) }
     if (showHistory) { AskHistoryScreen(repo, bottomPadding) { showHistory = false }; return }
-    val current by repo.currentConversation.collectAsState()
+    val current by repo.currentConversation.collectAsStateWithLifecycle()
     val c = Rs.colors
-    val messages by repo.messages.collectAsState(initial = emptyList())
-    val suggestions by repo.suggestions.collectAsState()
+    val messages by repo.messages.collectAsStateWithLifecycle(initialValue = emptyList())
+    val suggestions by repo.suggestions.collectAsStateWithLifecycle()
     val streaming = messages.any { it.streaming }
     val listState = rememberLazyListState()
     // 有新消息或回答变长时滚到底
@@ -144,25 +144,27 @@ private fun Welcome(suggestions: List<String>, onAsk: (String) -> Unit) {
 }
 
 @Composable
-private fun UserBubble(text: String) {
+internal fun UserBubble(text: String) {
     val c = Rs.colors
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-        Text(text, style = RsType.body, color = Color.White,
+        Text(text, style = RsType.body, color = c.onAccent,
             modifier = Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(20.dp, 20.dp, 6.dp, 20.dp)).background(c.accent).padding(horizontal = 16.dp, vertical = 11.dp))
     }
 }
 
 @Composable
-private fun AnswerCard(m: AskMessage, onConfirm: () -> Unit, onCancel: () -> Unit) {
+internal fun AnswerCard(m: AskMessage, onConfirm: () -> Unit, onCancel: () -> Unit) {
     val c = Rs.colors
     var openSource by remember(m.id) { mutableStateOf<Int?>(null) }
     RsCard(Modifier.animateContentSize(), padding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)) {
+        val error = m.error
+        val progress = m.progress
         when {
-            m.error != null -> Text(m.error, style = RsType.body, color = c.critical)
-            m.text.isEmpty() && m.progress != null -> Progress(m.progress)
+            error != null -> Text(error, style = RsType.body, color = c.critical)
+            m.text.isEmpty() && progress != null -> Progress(progress)
             else -> {
                 AnswerText(m.text)
-                if (m.streaming && m.progress != null) { Spacer(Modifier.height(8.dp)); Progress(m.progress) }
+                if (m.streaming && progress != null) { Spacer(Modifier.height(8.dp)); Progress(progress) }
             }
         }
         m.action?.let { a ->
@@ -194,7 +196,7 @@ private fun ActionCard(a: app.resound.ask.AskAction, onConfirm: () -> Unit, onCa
     val (bg, tag, tagColor) = when (a.state) {
         app.resound.ask.AskActionState.Pending -> Triple(c.accentSoft, "要改一下吗", c.accent)
         app.resound.ask.AskActionState.Done -> Triple(c.good.copy(alpha = 0.1f), "✓ 已改好", c.good)
-        app.resound.ask.AskActionState.Cancelled -> Triple(c.background, "已取消", c.textTertiary)
+        app.resound.ask.AskActionState.Cancelled -> Triple(c.fill, "已取消", c.textTertiary)
         app.resound.ask.AskActionState.Failed -> Triple(c.critical.copy(alpha = 0.08f), "没改成", c.critical)
     }
     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(bg).padding(14.dp)) {
@@ -205,7 +207,7 @@ private fun ActionCard(a: app.resound.ask.AskAction, onConfirm: () -> Unit, onCa
         if (a.state == app.resound.ask.AskActionState.Pending) {
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("确认", style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = Color.White,
+                Text("确认", style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = c.onAccent,
                     modifier = Modifier.clip(CircleShape).background(c.accent).springClick(onConfirm).padding(horizontal = 18.dp, vertical = 8.dp))
                 Text("算了", style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.textSecondary,
                     modifier = Modifier.clip(CircleShape).background(c.card).springClick(onCancel).padding(horizontal = 18.dp, vertical = 8.dp))
@@ -256,7 +258,7 @@ private fun SourceRow(n: Int, s: AskSource, open: Boolean, onClick: () -> Unit) 
         AnimatedVisibility(open) {
             Column(Modifier.padding(start = 26.dp, top = 6.dp)) {
                 Text("“${s.quote}”", style = RsType.subhead, color = c.text,
-                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(c.background).padding(10.dp))
+                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(c.fill).padding(10.dp))
                 if (current != null) Text("查看这件事 ›", style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.accent,
                     modifier = Modifier.padding(top = 6.dp).springClick { detail = true })
             }
@@ -309,8 +311,8 @@ private fun InputBar(streaming: Boolean, onSend: (String) -> Unit, onStop: () ->
                 .springClick { if (streaming) onStop() else send() },
             contentAlignment = Alignment.Center,
         ) {
-            if (streaming) Box(Modifier.size(14.dp).clip(RoundedCornerShape(3.dp)).background(Color.White))
-            else Text("↑", style = RsType.title.copy(fontWeight = FontWeight.Bold), color = if (active) Color.White else c.accent)
+            if (streaming) Box(Modifier.size(14.dp).clip(RoundedCornerShape(3.dp)).background(c.onAccent))
+            else Text("↑", style = RsType.title.copy(fontWeight = FontWeight.Bold), color = if (active) c.onAccent else c.accent)
         }
     }
 }

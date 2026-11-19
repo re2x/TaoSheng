@@ -1,5 +1,6 @@
 package app.resound.ui.today
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
@@ -21,6 +22,7 @@ import app.resound.capture.CaptureState
 import app.resound.ui.ShellNav
 import app.resound.ui.settings.SettingsPage
 import app.resound.ui.theme.Rs
+import app.resound.ui.theme.fade
 import app.resound.ui.theme.RsType
 import app.resound.ui.verify.RsCard
 import app.resound.ui.verify.springClick
@@ -49,21 +51,21 @@ fun StartChecklist(capture: CaptureController, hasLlmKey: Boolean, topGap: andro
     val prefs = remember { context.getSharedPreferences("ui", Context.MODE_PRIVATE) }
     var dismissed by remember { mutableStateOf(prefs.getBoolean(DISMISSED, false)) }
     if (dismissed) return
-    val status by capture.status.collectAsState()
+    val status by capture.status.collectAsStateWithLifecycle()
     val settings = if (AppGraph.isTranscribeReady) AppGraph.transcribeSettings as? AndroidTranscribeSettings else null
-    val transcribeReady = settings?.ready?.collectAsState()?.value ?: false
-    val local = settings?.source?.collectAsState()?.value == TranscribeSource.Local
-    val backend = settings?.backend?.collectAsState()?.value ?: LocalBackend.Cpu
+    val transcribeReady = settings?.ready?.collectAsStateWithLifecycle()?.value ?: false
+    val local = settings?.source?.collectAsStateWithLifecycle()?.value == TranscribeSource.Local
+    val backend = settings?.backend?.collectAsStateWithLifecycle()?.value ?: LocalBackend.Cpu
     // 下载进度写在 local-asr 里，每次变化 modelRevision 都会加一；跟着它重算，不用定时轮询
-    val revision = settings?.modelRevision?.collectAsState()?.value ?: 0
+    val revision = settings?.modelRevision?.collectAsStateWithLifecycle()?.value ?: 0
     val asrPrefs = remember { context.getSharedPreferences("local-asr", Context.MODE_PRIVATE) }
     val speakersDownloaded = remember(revision) { LocalModels.ready(context, LocalModels.speakers) }
     val speakersOn = remember(revision) { asrPrefs.getBoolean("speakers-enabled", true) }
     // 下载任务的真实状态；预览/截图里没有后台任务系统，当作没在下
     fun work(name: String) = if (settings == null) kotlinx.coroutines.flow.flowOf(null) else LocalModels.downloadActive(context, name)
-    val asrWork by remember { work(LocalModels.workName(LocalBackend.Npu)) }.collectAsState(null)
-    val asrCpuWork by remember { work(LocalModels.workName(LocalBackend.Cpu)) }.collectAsState(null)
-    val speakerWork by remember { work(LocalModels.SPEAKERS_WORK) }.collectAsState(null)
+    val asrWork by remember { work(LocalModels.workName(LocalBackend.Npu)) }.collectAsStateWithLifecycle(null)
+    val asrCpuWork by remember { work(LocalModels.workName(LocalBackend.Cpu)) }.collectAsStateWithLifecycle(null)
+    val speakerWork by remember { work(LocalModels.SPEAKERS_WORK) }.collectAsStateWithLifecycle(null)
     val asrDownloading = asrWork != null || asrCpuWork != null
     // 后台设置项每次回到页面都重查（用户可能刚从系统设置回来）
     // 一出现就先查一次，不等页面恢复事件：避免打开 App 的第一帧把这一项当成没做完
@@ -104,10 +106,10 @@ fun StartChecklist(capture: CaptureController, hasLlmKey: Boolean, topGap: andro
     )
     // 0.2.21：走过开箱向导的用户，前面几项已在向导里做完，这里改成“继续完善”的可选项
     val wizard = remember { prefs.getBoolean("onboarded", false) }
-    val backupState = if (AppGraph.isBackupReady) AppGraph.backup.state.collectAsState().value else null
-    val localBackup = if (AppGraph.isBackupReady) AppGraph.backup.local.collectAsState().value else null
-    val pushChannels = if (AppGraph.isPushReady) AppGraph.push.channels.collectAsState(emptyList()).value else emptyList()
-    val footprint = if (AppGraph.isLocationReady) AppGraph.location.settings.enabled.collectAsState().value else false
+    val backupState = if (AppGraph.isBackupReady) AppGraph.backup.state.collectAsStateWithLifecycle().value else null
+    val localBackup = if (AppGraph.isBackupReady) AppGraph.backup.local.collectAsStateWithLifecycle().value else null
+    val pushChannels = if (AppGraph.isPushReady) AppGraph.push.channels.collectAsStateWithLifecycle(emptyList()).value else emptyList()
+    val footprint = if (AppGraph.isLocationReady) AppGraph.location.settings.enabled.collectAsStateWithLifecycle().value else false
     val shown = if (!wizard) steps else buildList {
         if (!listening) add(steps[0])
         if (!transcribeReady && !asrDownloading) add(steps[1])
@@ -139,7 +141,8 @@ fun StartChecklist(capture: CaptureController, hasLlmKey: Boolean, topGap: andro
         // 进度条：完成几步亮几格
         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             shown.forEach { step ->
-                val color by animateColorAsState(if (step.done) c.accent else c.separator, label = "stepBar")
+                // 进度条是辅助信息：夜间降到六成白，不和按钮抢
+                val color by animateColorAsState(if (step.done) (if (c.isDark) c.accent.fade(0.6f) else c.accent) else c.track, label = "stepBar")
                 Box(Modifier.weight(1f).height(4.dp).clip(CircleShape).background(color))
             }
         }
@@ -154,7 +157,7 @@ fun StartChecklist(capture: CaptureController, hasLlmKey: Boolean, topGap: andro
                     else -> c.accentSoft
                 }), contentAlignment = Alignment.Center) {
                     Text(if (step.done) "✓" else "${i + 1}", style = RsType.caption.copy(fontWeight = FontWeight.SemiBold),
-                        color = when { step.done -> c.good; i == next -> Color.White; else -> c.accent })
+                        color = when { step.done -> c.good; i == next -> c.onAccent; else -> c.accent })
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -184,7 +187,7 @@ internal fun downloadLine(settings: AndroidTranscribeSettings?, backend: LocalBa
 @Composable
 private fun SmallAction(text: String, filled: Boolean, onClick: () -> Unit) {
     val c = Rs.colors
-    Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (filled) Color.White else c.accent, maxLines = 1,
+    Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (filled) c.onAccent else c.accent, maxLines = 1,
         modifier = Modifier.springClick(onClick).clip(CircleShape).background(if (filled) c.accent else c.accentSoft).padding(horizontal = 14.dp, vertical = 6.dp))
 }
 

@@ -1,11 +1,13 @@
 package app.resound.ui.transcript
 
 import androidx.compose.animation.AnimatedVisibility
+import app.resound.ui.theme.fade
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -97,6 +99,18 @@ private fun Bar(inline: Boolean = false) {
     } else lines.indexOfFirst { it.id == LinePlayer.currentLineId }.coerceAtLeast(0)
     fun mmss(ms: Long) = "%d:%02d".format(ms / 60_000, ms / 1000 % 60)
     val segs = LinePlayer.segmentOrder.size
+    // 卡 195：回放时在当前位置打点；4 秒内可撤销
+    val markScope = androidx.compose.runtime.rememberCoroutineScope()
+    var lastMark by remember { mutableStateOf<app.resound.marks.MarkRow?>(null) }
+    androidx.compose.runtime.LaunchedEffect(lastMark) { if (lastMark != null) { kotlinx.coroutines.delay(4_000); lastMark = null } }
+    fun markHere() {
+        if (!app.resound.AppGraph.isMarksReady) return
+        val at = LinePlayer.positionAt.takeIf { it > 0 } ?: return
+        markScope.launch {
+            lastMark = runCatching { app.resound.AppGraph.marks.playback(at, 0, 0) }
+                .onFailure { app.resound.diagnostics.FailureNotes.record("ui/transcript/PlayerBar.kt:mark", it) }.getOrNull()
+        }
+    }
     val segIdx = dragAt?.let { LinePlayer.segmentOrder.indexOf(it.first).coerceAtLeast(0) } ?: LinePlayer.segmentIndex
     val sourceLabel = if (inline) null else when (LinePlayer.source) { is PlaySource.Event -> "回到这件事 ›"; is PlaySource.Transcript -> "回到原话 ›"; is PlaySource.Import -> "回到这次导入 ›"; null -> null }
     fun goBack() {
@@ -136,7 +150,7 @@ private fun Bar(inline: Boolean = false) {
                     IconCircle(c.accentSoft, onClick = { LinePlayer.skipSegment() }) { NextIcon(c.accent) }
                     Spacer(Modifier.width(6.dp))
                 }
-                IconCircle(c.background, onClick = { LinePlayer.stop() }) { CloseIcon(c.textTertiary) }
+                IconCircle(c.fill, onClick = { LinePlayer.stop() }) { CloseIcon(c.textTertiary) }
             }
         } else {
             // 展开：顶行 段数 · 回到来源 · 倍速 · 收起 · 关闭；三行字幕；进度条；控制行 上一段 · −15 播放 +15 · 下一段
@@ -151,13 +165,18 @@ private fun Bar(inline: Boolean = false) {
                                 modifier = Modifier.clip(CircleShape).springClick { goBack() }.padding(vertical = 4.dp))
                         }
                     }
+                    if (app.resound.AppGraph.isMarksReady) {
+                        Text("📍记一下", style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.accent,
+                            modifier = Modifier.clip(CircleShape).background(c.accentSoft).springClick { markHere() }.padding(horizontal = 10.dp, vertical = 5.dp))
+                        Spacer(Modifier.width(6.dp))
+                    }
                     SpeedChip()
                     Spacer(Modifier.width(6.dp))
                     if (!inline) {
-                        IconCircle(c.background, onClick = { expanded = false }) { ChevronDownIcon(c.textTertiary) }
+                        IconCircle(c.fill, onClick = { expanded = false }) { ChevronDownIcon(c.textTertiary) }
                         Spacer(Modifier.width(6.dp))
                     }
-                    IconCircle(c.background, onClick = { LinePlayer.stop() }) { CloseIcon(c.textTertiary) }
+                    IconCircle(c.fill, onClick = { LinePlayer.stop() }) { CloseIcon(c.textTertiary) }
                 }
                 Column(Modifier.fillMaxWidth().height(92.dp), verticalArrangement = Arrangement.Center) {
                     // 三行一直排满：开头没有上一句时当前句往上顶，结尾没有下一句时往下沉
@@ -172,6 +191,12 @@ private fun Bar(inline: Boolean = false) {
                 SeekBar(frac, onDrag = { dragging = it }, onDone = { f -> LinePlayer.seekFraction(f); dragging = null })
                 Row {
                     Text(mmss((frac * total).toLong()), style = RsType.caption, color = c.textTertiary, modifier = Modifier.weight(1f))
+                    lastMark?.let { m ->
+                        Text(app.resound.marks.MarkFeedback.text(m.at) + " · 撤销", style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.accent,
+                            modifier = Modifier.clip(CircleShape).springClick { markScope.launch { app.resound.AppGraph.marks.undo(m.id) }; lastMark = null }
+                                .padding(horizontal = 6.dp))
+                    }
+                    Spacer(Modifier.weight(1f))
                     Text(mmss(total), style = RsType.caption, color = c.textTertiary)
                 }
                 Box(Modifier.fillMaxWidth()) {
@@ -197,8 +222,8 @@ private fun Bar(inline: Boolean = false) {
 @Composable
 private fun SegmentPill(label: String, back: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
-    val tint = if (enabled) c.accent else c.textTertiary.copy(alpha = 0.6f)
-    Row(modifier.height(30.dp).clip(CircleShape).background(if (enabled) c.accentSoft else c.background)
+    val tint = if (enabled) c.accent else c.textTertiary.fade(0.6f)
+    Row(modifier.height(30.dp).clip(CircleShape).background(if (enabled) c.accentSoft else c.fill)
         .then(if (enabled) Modifier.springClick(onClick) else Modifier).padding(horizontal = 9.dp), verticalAlignment = Alignment.CenterVertically) {
         if (back) { NextIcon(tint, Modifier.graphicsLayer { scaleX = -1f }); Spacer(Modifier.width(4.dp)) }
         Text(label, style = RsType.caption.copy(fontWeight = FontWeight.SemiBold), color = tint)

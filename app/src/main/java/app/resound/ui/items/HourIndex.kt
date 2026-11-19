@@ -131,8 +131,8 @@ fun HourIndex(slots: List<HourSlot>, currentKey: Any?, modifier: Modifier, onJum
             Column(Modifier.fillMaxSize()) {
                 slots.forEachIndexed { s, slot ->
                     val on = s == activeSlot
-                    val fg by animateColorAsState(if (on) Color.White else c.textSecondary, label = "hourFg")
-                    val bg by animateColorAsState(if (on) c.accent else c.accent.copy(alpha = 0f), label = "hourBg")
+                    val fg by animateColorAsState(if (on) c.onSelected else c.textSecondary, label = "hourFg")
+                    val bg by animateColorAsState(if (on) c.selected else c.accent.copy(alpha = 0f), label = "hourBg")
                     Box(Modifier.height(with(density) { heights[s].toDp() }).fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
                         Text("${slot.hour}", style = RsType.caption.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold), color = fg,
                             textAlign = TextAlign.Center,
@@ -151,7 +151,7 @@ fun HourIndex(slots: List<HourSlot>, currentKey: Any?, modifier: Modifier, onJum
         if (touching >= 0) {
             val y = yOf(touching)
             Text(
-                flat[touching].label, style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = Color.White,
+                flat[touching].label, style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = c.onAccent,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.align(Alignment.TopEnd).offset { IntOffset(-(38.dp).roundToPx(), (y - 18.dp.toPx()).roundToInt()) }
                     .wrapContentWidth(Alignment.End, unbounded = true).widthIn(max = 260.dp).shadow(8.dp, RoundedCornerShape(14.dp)).clip(RoundedCornerShape(14.dp)).background(c.accent)

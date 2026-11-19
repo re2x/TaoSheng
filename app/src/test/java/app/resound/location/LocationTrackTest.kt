@@ -1,5 +1,6 @@
 package app.resound.location
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -49,7 +50,7 @@ class LocationTrackTest {
         val context = RuntimeEnvironment.getApplication() as Context
         val name = "location-migration.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/29.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/29.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -63,10 +64,10 @@ class LocationTrackTest {
             for (i in 0 until queries.length()) old.execSQL(queries.getString(i))
             old.version = 29
         }
-        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, db.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, db.testSql.version)
             db.location().insert(p(10, 31.23, 121.47))
             assertEquals(1, db.location().between(0, 20 * min).first().size)
             assertEquals(1, db.location().deleteBetween(0, 20 * min))

@@ -1,5 +1,6 @@
 package app.resound.ui.redo
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -19,7 +20,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -68,17 +68,17 @@ internal fun costText(yuan: Double?): String? = yuan?.let { if (it < 0.005) "免
 @Composable
 fun AsrChoice(chooser: AsrChooser, durationMs: Long, selected: TranscribeSource, onSelect: (TranscribeSource) -> Unit) {
     val c = Rs.colors
-    val options by chooser.options.collectAsState()
+    val options by chooser.options.collectAsStateWithLifecycle()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         options.forEach { o ->
             val on = o.source == selected && o.ready
             val est: AsrEstimate? = remember(o.source, durationMs) { if (o.ready) chooser.estimate(durationMs, o.source) else null }
-            val bg by animateColorAsState(if (on) c.accentSoft else c.background, spring(stiffness = Spring.StiffnessMediumLow), label = "asr")
+            val bg by animateColorAsState(if (on) c.accentSoft else c.fill, spring(stiffness = Spring.StiffnessMediumLow), label = "asr")
             Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(bg)
                 .then(if (o.ready) Modifier.springClick { onSelect(o.source) } else Modifier)
                 .padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(18.dp).clip(CircleShape).background(if (on) c.accent else c.separator), contentAlignment = Alignment.Center) {
-                    if (on) Box(Modifier.size(7.dp).clip(CircleShape).background(Color.White))
+                Box(Modifier.size(18.dp).clip(CircleShape).background(if (on) c.selected else c.separator), contentAlignment = Alignment.Center) {
+                    if (on) Box(Modifier.size(7.dp).clip(CircleShape).background(c.onSelected))
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -94,10 +94,10 @@ fun AsrChoice(chooser: AsrChooser, durationMs: Long, selected: TranscribeSource,
 @Composable
 private fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
     val c = Rs.colors
-    Row(Modifier.fillMaxWidth().clip(CircleShape).background(c.separator.copy(alpha = if (c.isDark) 1f else 0.7f)).padding(3.dp)) {
+    Row(Modifier.fillMaxWidth().clip(CircleShape).background(c.track).padding(3.dp)) {
         options.forEachIndexed { i, label ->
             val on = i == selected
-            val bg by animateColorAsState(if (on) c.card else c.card.copy(alpha = 0f), label = "seg")
+            val bg by animateColorAsState(if (on) c.trackThumb else c.trackThumb.copy(alpha = 0f), label = "seg")
             Box(Modifier.weight(1f).clip(CircleShape).background(bg).springClick { onSelect(i) }.padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
                 Text(label, style = RsType.subhead, color = if (on) c.text else c.textSecondary, maxLines = 1)
             }
@@ -120,17 +120,17 @@ fun RedoSheet(eventIds: List<Long> = emptyList(), segmentIds: List<Long> = empty
     val c = Rs.colors
     val segmentsOnly = eventIds.isEmpty()
     var scope by remember { mutableStateOf(if (merge) RedoScope.Merge else if (segmentsOnly) RedoScope.TranscribeOnly else RedoScope.DigestOnly) }
-    val last by repo.asr.lastChoice.collectAsState()
-    val asrOptions by repo.asr.options.collectAsState()
+    val last by repo.asr.lastChoice.collectAsStateWithLifecycle()
+    val asrOptions by repo.asr.options.collectAsStateWithLifecycle()
     var asr by remember { mutableStateOf(last) }
-    val llms by repo.llmOptions.collectAsState()
+    val llms by repo.llmOptions.collectAsStateWithLifecycle()
     var llm by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(llms) { if (llm == null || llms.none { it.presetId == llm && it.ready }) llm = llms.firstOrNull { it.ready }?.presetId }
     val needsAsr = scope.transcribes
     fun request() = RedoRequest(eventIds, segmentIds, scope, if (needsAsr) asr else null, if (scope != RedoScope.TranscribeOnly) llm else null)
     val estimate by produceState<RedoEstimate?>(null, scope, asr, llm) { value = runCatching { repo.estimate(request()) }.getOrNull() }
     var jobId by remember { mutableStateOf<String?>(null) }
-    val jobs by repo.jobs.collectAsState()
+    val jobs by repo.jobs.collectAsStateWithLifecycle()
     val job = jobId?.let { id -> jobs.firstOrNull { it.id == id } }
     val title = if (merge) "合并 ${eventIds.size} 件事" else if (segmentsOnly) "重新转写 ${segmentIds.size} 段录音" else "重做 ${eventIds.size} 件事"
     RsSheet(title, null, onDismiss = onDismiss, fixedHeight = job == null) {
@@ -153,12 +153,12 @@ fun RedoSheet(eventIds: List<Long> = emptyList(), segmentIds: List<Long> = empty
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 llms.forEach { o ->
                     val on = o.presetId == llm
-                    val bg by animateColorAsState(if (on) c.accentSoft else c.background, label = "llm")
+                    val bg by animateColorAsState(if (on) c.accentSoft else c.fill, label = "llm")
                     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(bg)
                         .then(if (o.ready) Modifier.springClick { llm = o.presetId } else Modifier)
                         .padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(18.dp).clip(CircleShape).background(if (on) c.accent else c.separator), contentAlignment = Alignment.Center) {
-                            if (on) Box(Modifier.size(7.dp).clip(CircleShape).background(Color.White))
+                        Box(Modifier.size(18.dp).clip(CircleShape).background(if (on) c.selected else c.separator), contentAlignment = Alignment.Center) {
+                            if (on) Box(Modifier.size(7.dp).clip(CircleShape).background(c.onSelected))
                         }
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
@@ -183,7 +183,7 @@ fun RedoSheet(eventIds: List<Long> = emptyList(), segmentIds: List<Long> = empty
                 etaText(e.etaMillis)?.let { "预计 ${it.removePrefix("约 ")}" },
                 costText(e.costYuan)?.let { "转写 $it" },
             ).joinToString(" · ")
-            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(14.dp),
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (line.isNotBlank()) Text(line, style = RsType.subhead, color = c.textSecondary)
                 warn.forEach { Text("· $it", style = RsType.caption, color = c.warning) }
@@ -206,7 +206,7 @@ fun RedoSheet(eventIds: List<Long> = emptyList(), segmentIds: List<Long> = empty
 fun RedoJobSheet(jobId: String, onDismiss: () -> Unit) {
     if (!AppGraph.isRedoReady) { onDismiss(); return }
     val repo = AppGraph.redo
-    val job = repo.jobs.collectAsState().value.firstOrNull { it.id == jobId }
+    val job = repo.jobs.collectAsStateWithLifecycle().value.firstOrNull { it.id == jobId }
     if (job == null) { LaunchedEffect(Unit) { onDismiss() }; return }
     RsSheet(job.title, null, onDismiss = onDismiss) { JobBody(repo, job, onDismiss) }
 }

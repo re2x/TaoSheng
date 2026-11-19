@@ -1,10 +1,15 @@
 package app.resound.backup
 
+import app.resound.search.SearchIndex
+
 import android.content.Context
-import android.database.Cursor
-import android.database.sqlite.SQLiteDatabase
-import androidx.sqlite.db.SupportSQLiteDatabase
-import app.resound.data.CaptureDatabase
+import androidx.sqlite.*
+import androidx.sqlite.driver.AndroidSQLiteDriver
+import androidx.room.PooledConnection
+import androidx.room.useWriterConnection
+import androidx.room.immediateTransaction
+import kotlinx.coroutines.runBlocking
+import app.resound.data.*
 import org.json.JSONObject
 import java.io.File
 import java.time.Instant
@@ -13,7 +18,7 @@ import java.time.ZoneId
 /** 分卷只保存数据，不执行备份中的 SQL；列名、表名始终由当前 App 决定。 */
 internal object DayVolumeRows {
     val dated = linkedMapOf(
-        "topics" to "createdAt", "topic_spans" to "startAt", "topic_marks" to "at",
+        "folder_recordings" to "startAt", "marks" to "at", "topics" to "createdAt", "topic_spans" to "startAt", "topic_marks" to "at",
         "import_records" to "startAt", "segments" to "startAt", "transcript_lines" to "startAt", "memory_events" to "startAt",
         "thing_records" to "at", "memory_items" to "createdAt", "skill_cards" to "at", "reviews" to "generatedAt",
         "ask_conversations" to "createdAt", "ask_messages" to "at",
@@ -21,8 +26,17 @@ internal object DayVolumeRows {
         "app_power" to "at", "battery" to "at", "heartbeats" to "at", "watchdog" to "at", "env_sounds" to "startAt",
         // 足迹（PR #19）：定位点按天分卷
         "location_points" to "at",
+        // 屏幕时间原始事件按天分卷
+        "screen_events" to "at",
+        // 设备播放记录按开始时刻分卷
+        "playback_rows" to "fromAt",
+        // 夜间睡眠（卡 202/203/208）：夜晚与其事件、片段、声音包络、反馈、记梦按开始时刻分卷
+        "nights" to "start", "night_events" to "start", "night_clips" to "start", "night_envelope" to "start",
+        "night_feedback" to "at", "night_dreams" to "at",
     )
-    val global = setOf("import_fingerprints", "folder_observations", "device_transfers", "things", "thing_watch_state", "voiceprint_people", "voiceprint_samples", "voiceprint_exclusions", "location_places")
+    val global = setOf("import_fingerprints", "folder_observations", "device_transfers", "things", "thing_watch_state", "voiceprint_people", "voiceprint_samples",
+        "voiceprint_exclusions", "location_places", "screen_app_names", "screen_pull_state", "screen_coverage_gaps",
+        "night_tags", "night_tag_links", "night_personal", "night_weeks", "night_notice")
     val zone: ZoneId = ZoneId.of("Asia/Shanghai")
     fun day(at: Long): String = Instant.ofEpochMilli(at).atZone(zone).toLocalDate().toString()
     fun canonical(value: Any?): String = when (value) {
@@ -39,25 +53,25 @@ internal object DayVolumeRows {
         check(directory.mkdirs())
         val files = sortedMapOf<String, File>()
         val writers = java.util.LinkedHashMap<String, java.io.BufferedWriter>(16, 0.75f, true)
-        try { SQLiteDatabase.openDatabase(source.path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
+        try { AndroidSQLiteDriver().open(source.path).use { db ->
             (dated.keys + global).sorted().forEach { table ->
                 val keys = mutableListOf<Pair<Int, String>>()
-                db.rawQuery("PRAGMA table_info(`$table`)", null).use { c ->
-                    while (c.moveToNext()) if (c.getInt(5) > 0) keys += c.getInt(5) to c.getString(1)
+                db.prepare("PRAGMA table_info(`$table`)").use { c ->
+                    while (c.step()) if (c.getLong(5).toInt() > 0) keys += c.getLong(5).toInt() to c.getText(1)
                 }
                 require(keys.isNotEmpty())
                 val order = keys.sortedBy { it.first }.joinToString { "`${it.second}`" }
-                db.rawQuery("SELECT * FROM `$table` ORDER BY $order", null).use { c ->
+                db.prepare("SELECT * FROM `$table` ORDER BY $order").use { c ->
                     val columns = c.columnNames.sorted()
-                    while (c.moveToNext()) {
+                    while (c.step()) {
                         val values = JSONObject()
                         for (column in columns) {
-                            val i = c.getColumnIndexOrThrow(column)
-                            val v: Any = when (c.getType(i)) {
-                                Cursor.FIELD_TYPE_NULL -> JSONObject.NULL
-                                Cursor.FIELD_TYPE_INTEGER -> c.getLong(i)
-                                Cursor.FIELD_TYPE_FLOAT -> c.getDouble(i)
-                                Cursor.FIELD_TYPE_STRING -> c.getString(i)
+                            val i = c.columnNames.indexOf(column).also { require(it >= 0) }
+                            val v: Any = when (c.getColumnType(i)) {
+                                SQLITE_DATA_NULL -> JSONObject.NULL
+                                SQLITE_DATA_INTEGER -> c.getLong(i)
+                                SQLITE_DATA_FLOAT -> c.getDouble(i)
+                                SQLITE_DATA_TEXT -> c.getText(i)
                                 else -> JSONObject().put("blob", android.util.Base64.encodeToString(c.getBlob(i), android.util.Base64.NO_WRAP))
                             }
                             values.put(column, v)
@@ -75,10 +89,10 @@ internal object DayVolumeRows {
                 }
             }
             files.getOrPut("state") { File(directory, "state.jsonl").apply { writeText("") } }
-            return db.version to files
+            return db.userVersion to files
         } } finally { writers.values.forEach { it.close() } }
     }
-    fun insert(db: SupportSQLiteDatabase, rows: File, state: Boolean) {
+    suspend fun insert(db: PooledConnection, rows: File, state: Boolean) {
         rows.bufferedReader().useLines { lines -> lines.forEach { line ->
             val row = JSONObject(line)
             val originalTable = row.getString("table")
@@ -88,9 +102,9 @@ internal object DayVolumeRows {
             if (originalTable == "llm_usage") values.put("purpose", "Other")
             val columns = mutableListOf<String>()
             val args = mutableListOf<Any?>()
-            db.query("PRAGMA table_info(`$table`)").use { c ->
-                while (c.moveToNext()) {
-                    val name = c.getString(1)
+            db.usePrepared("PRAGMA table_info(`$table`)") { c ->
+                while (c.step()) {
+                    val name = c.getText(1)
                     if (values.has(name)) {
                         columns += name
                         val value = values.get(name)
@@ -99,38 +113,46 @@ internal object DayVolumeRows {
                             is JSONObject -> android.util.Base64.decode(value.getString("blob"), android.util.Base64.NO_WRAP)
                             else -> value
                         }
-                    } else if (c.getInt(3) != 0 && c.isNull(4)) {
+                    } else if (c.getLong(3).toInt() != 0 && c.isNull(4)) {
                         // 老分卷没有的新必填列：Room 未声明 SQL 默认值时使用类型零值。
                         columns += name
-                        args += if (c.getString(2).contains("INT", true) || c.getString(2).contains("REAL", true)) 0 else ""
+                        args += if (c.getText(2).contains("INT", true) || c.getText(2).contains("REAL", true)) 0 else ""
                     }
                 }
             }
             require(values.keys().asSequence().all { key -> key in columns })
-            db.execSQL("INSERT INTO `$table` (${columns.joinToString { "`$it`" }}) VALUES (${columns.joinToString { "?" }})", args.toTypedArray())
+            db.executeSql("INSERT INTO `$table` (${columns.joinToString { "`$it`" }}) VALUES (${columns.joinToString { "?" }})", args.toTypedArray())
         } }
     }
     fun rebuild(context: Context, destination: File, version: Int, state: File, days: List<File>) {
         destination.parentFile!!.mkdirs()
         val room = CaptureDatabase.open(context, destination.absolutePath)
         try {
-            val db = room.openHelper.writableDatabase
-            if (version > db.version) throw BackupFailure("备份数据库版本比 App 新，请先升级 App")
-            require(version > 0)
-            // 跨天父子记录先全部插入，最后检查外键；此连接始终可写。
-            db.execSQL("PRAGMA foreign_keys=OFF")
-            db.beginTransaction()
-            try {
-                insert(db, state, true)
-                days.forEach { insert(db, it, false) }
-                listOf("lines_fts", "events_fts", "items_fts").forEach { db.execSQL("DELETE FROM $it") }
-                app.resound.search.SearchIndex.install(db, backfill = true)
-                db.query("PRAGMA foreign_key_check").use { require(!it.moveToFirst()) }
-                db.query("PRAGMA integrity_check").use { require(it.moveToFirst() && it.getString(0) == "ok" && !it.moveToNext()) }
-                db.setTransactionSuccessful()
-            } finally { db.endTransaction() }
-            db.query("PRAGMA wal_checkpoint(TRUNCATE)").use { require(it.moveToFirst() && it.getInt(0) == 0) }
+            runBlocking { room.useWriterConnection { db ->
+                val current = db.usePrepared("PRAGMA user_version") { check(it.step()); it.getLong(0).toInt() }
+                if (version > current) throw BackupFailure("备份数据库版本比 App 新，请先升级 App")
+                require(version > 0)
+                // 跨天父子记录先全部插入，最后检查外键；开关与事务始终使用同一 writer。
+                db.executeSql("PRAGMA foreign_keys=OFF")
+                try {
+                    db.immediateTransaction {
+                        insert(this, state, true)
+                        days.forEach { insert(this, it, false) }
+                        executeSql(app.resound.marks.MarkSchema.BACKFILL)
+                        executeSql(app.resound.marks.MarkSchema.CLEAN_EMPTY_SEQUENCE)
+                        // 恢复收尾：覆盖指针以表内实际事件为准；状态卷比事件卷新时避免假覆盖。
+                        executeSql("UPDATE screen_pull_state SET coveredUntil = COALESCE((SELECT MAX(at) FROM screen_events), coveredUntil) WHERE source = 'screen'")
+                        listOf("lines_fts", "events_fts", "items_fts").forEach { executeSql("DELETE FROM $it") }
+                        val statements = mutableListOf<String>()
+                        SearchIndex.install({ statements += it }, backfill = true)
+                        statements.forEach { executeSql(it) }
+                        usePrepared("PRAGMA foreign_key_check") { require(!it.step()) }
+                        usePrepared("PRAGMA integrity_check") { require(it.step() && it.getText(0) == "ok" && !it.step()) }
+                    }
+                } finally { db.executeSql("PRAGMA foreign_keys=ON") }
+                db.usePrepared("PRAGMA wal_checkpoint(TRUNCATE)") { require(it.step() && it.getLong(0) == 0L) }
+            } }
         } finally { room.close() }
-        listOf("-wal", "-shm", "-journal").forEach { File(destination.path + it).delete() }
+        listOf("-wal", "-shm", "-journal", ".lck").forEach { File(destination.path + it).delete() }
     }
 }

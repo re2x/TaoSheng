@@ -1,5 +1,6 @@
 package app.resound.ui.items
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -24,7 +25,6 @@ import androidx.compose.material3.TimePickerDefaults
 import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -55,8 +55,8 @@ import java.time.format.DateTimeFormatter
 @Composable
 internal fun Choice(text: String, on: Boolean, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (on) c.accent else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
-    Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) Color.White else c.textSecondary,
+    val bg by animateColorAsState(if (on) c.selected else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
+    Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) c.onSelected else c.textSecondary,
         modifier = Modifier.clip(CircleShape).background(bg).springClick(onClick).padding(horizontal = 14.dp, vertical = 8.dp))
 }
 
@@ -99,7 +99,7 @@ internal fun EditItemSheet(item: MemoryItem, memory: MemoryRepository, strongOn:
 @Composable
 internal fun StrongReminderRow(on: Boolean, onChange: (Boolean) -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (on) c.accentSoft else c.background, spring(stiffness = Spring.StiffnessMediumLow), label = "strongRow")
+    val bg by animateColorAsState(if (on) c.accentSoft else c.fill, spring(stiffness = Spring.StiffnessMediumLow), label = "strongRow")
     var setup by remember { mutableStateOf(false) }
     Column {
     androidx.compose.foundation.layout.Row(
@@ -170,14 +170,14 @@ internal fun DueChoice(day: LocalDate?, time: LocalTime?, onDay: (LocalDate?) ->
 @Composable
 internal fun ReminderSheet(memory: MemoryRepository, onDismiss: () -> Unit) {
     val c = Rs.colors
-    val r by memory.appointmentReminders.collectAsState()
+    val r by memory.appointmentReminders.collectAsStateWithLifecycle()
     fun set(v: AppointmentReminders) = memory.setAppointmentReminders(v)
     RsSheet("约定提醒", "有时间的约定和待办会提前提醒你，和到期提醒走同一个地方（手机通知和推送通道）。", onDismiss = onDismiss) {
         var setup by remember { mutableStateOf(false) }
         val context = androidx.compose.ui.platform.LocalContext.current
         val missing = remember { app.resound.push.StrongSetup.missing(context) }
         androidx.compose.foundation.layout.Row(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
-            .background(c.background).springClick { setup = true }.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            .background(c.fill).springClick { setup = true }.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("强提醒需要打开的功能", style = RsType.body, color = c.text)
                 Text(if (missing == 0) "已经开好" else "还有 $missing 项没打开", style = RsType.caption, color = if (missing == 0) c.good else c.warning)

@@ -1,5 +1,6 @@
 package app.resound.push
 
+import kotlinx.datetime.toKotlinLocalDate
 import android.app.Application
 import android.content.Context
 import androidx.work.*
@@ -90,7 +91,7 @@ class PushChannelsTest {
             }
             assertEquals(3, fake.requests.size)
             // JSON 不受支持时，带回顾的消息也必须真正按 Markdown 渲染。
-            val review = app.resound.review.DailyReview(java.time.LocalDate.parse("2026-10-23"), "简述", emptyList(), 1)
+            val review = app.resound.review.DailyReview(java.time.LocalDate.parse("2026-10-23").toKotlinLocalDate(), "简述", emptyList(), 1)
             val reviewMessage = message.copy(review = review)
             fake.reply("{\"errcode\":0}")
             fake.transport.send(PushKind.WeCom, PushFormat.Json, configs.getValue(PushKind.WeCom), reviewMessage).getOrThrow()
@@ -146,9 +147,17 @@ class PushChannelsTest {
     @Test fun checksVendorCodesRedirectsMalformedAndOversizedResponses() = runBlocking {
         FakeServer().use { fake ->
             configs.keys.forEach { kind ->
-                fake.reply("{\"code\":500,\"errcode\":40013,\"errmsg\":\"fake-token-123 https://secret.test/path\"}", if (kind == PushKind.Webhook) 500 else 200)
+                // 卡 060 保留服务原因，只脱敏本通道实际配置的凭证。
+                val secret = configs.getValue(kind).getValue(when (kind) {
+                    PushKind.PushPlus -> "token"
+                    PushKind.WeCom -> "webhook"
+                    PushKind.ServerChan -> "sendKey"
+                    else -> "authorization"
+                })
+                fake.reply(JSONObject().put("code", 500).put("errcode", 40013)
+                    .put("errmsg", "$secret https://secret.test/path").toString(), if (kind == PushKind.Webhook) 500 else 200)
                 val error = fake.transport.send(kind, PushFormat.Text, configs.getValue(kind), message).exceptionOrNull()!!
-                assertFalse(error.toString().contains("fake-token")); assertFalse(error.toString().contains("https://"))
+                assertFalse(error.toString().contains(secret)); assertFalse(error.toString().contains("https://"))
                 fake.take()
             }
             listOf("{}", "{\"code\":\"200\"}", "invalid", "x".repeat(65537)).forEach { body ->

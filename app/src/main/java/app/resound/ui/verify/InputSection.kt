@@ -1,5 +1,6 @@
 package app.resound.ui.verify
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -17,7 +18,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -37,9 +37,9 @@ import app.resound.ui.theme.RsType
 @Composable
 fun InputSection(inputs: InputDevices) {
     val c = Rs.colors
-    val choice by inputs.choice.collectAsState()
-    val devices by inputs.devices.collectAsState()
-    val status by inputs.status.collectAsState()
+    val choice by inputs.choice.collectAsStateWithLifecycle()
+    val devices by inputs.devices.collectAsStateWithLifecycle()
+    val status by inputs.status.collectAsStateWithLifecycle()
     val external = devices.filter { it.kind != InputKind.Phone }
     // 安卓 12 起用蓝牙耳机录音要“附近设备”权限；选的时候再要，拒绝了后台会退回手机麦克风
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -81,6 +81,33 @@ fun InputSection(inputs: InputDevices) {
             if (status.using.kind != InputKind.Phone)
                 Text("换了麦克风，头几天“认出我”可能不准，在原话里多标几句“这是我”就好。", style = RsType.caption, color = c.textTertiary)
         }
+        // 卡 193：蓝牙麦录音要占通话通道，放视频音乐会没声；连过蓝牙麦才显示这两项
+        if (external.any { isBluetooth(it.kind) }) {
+            val yieldSettings = androidx.compose.runtime.remember { app.resound.audio.BluetoothYieldSettings(context) }
+            val opts by yieldSettings.changes.collectAsStateWithLifecycle(initialValue = yieldSettings.read())
+            Spacer(Modifier.height(12.dp))
+            RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("用蓝牙麦时，放视频音乐自动让出", style = RsType.body, color = c.text)
+                        Text(if (opts.enabled) "放视频、音乐时先把蓝牙麦让出来，声音照常从手机或耳机出；停下约 3 秒后自动接回"
+                            else "一直占着蓝牙麦：这期间看视频、听音乐可能没声音", style = RsType.caption, color = c.textSecondary)
+                    }
+                    RsToggle(opts.enabled) { yieldSettings.setEnabled(it) }
+                }
+                if (opts.enabled) {
+                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text("让出期间用手机麦克风继续录", style = RsType.body, color = c.text)
+                            Text(if (opts.continueOnPhone) "不漏记；手机外放的声音照常会被标出来，不当成你说的话"
+                                else "让出期间暂停录音，接回蓝牙麦后继续", style = RsType.caption, color = c.textSecondary)
+                        }
+                        RsToggle(opts.continueOnPhone) { yieldSettings.setContinueOnPhone(it) }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -90,7 +117,7 @@ private fun Divider() = Box(Modifier.padding(start = 64.dp).fillMaxWidth().heigh
 @Composable
 private fun ChoiceRow(title: String, sub: String, glyph: String, tint: Color, selected: Boolean, dim: Boolean = false, onClick: () -> Unit) {
     val c = Rs.colors
-    val ring by animateColorAsState(if (selected) c.accent else c.separator, label = "ring")
+    val ring by animateColorAsState(if (selected) c.selected else c.separator, label = "ring")
     Row(Modifier.fillMaxWidth().springClick(onClick).padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(36.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)), contentAlignment = Alignment.Center) {
             Text(glyph, style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = tint)

@@ -1,5 +1,9 @@
 package app.resound.recordings
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.scheduling.BackgroundRefreshPolicy
+import app.resound.scheduling.refreshWhileNeeded
 import android.content.Context
 import androidx.work.*
 import app.resound.AppGraph
@@ -30,6 +34,7 @@ internal class RecordingAudioPush(
         }.flowOn(Dispatchers.IO)
     suspend fun refresh() {
         val list = channels.channels.value
+        RecordingAudioSweepWorker.schedule(context, list)
         (configured.keys - list.map { it.id }.toSet()).forEach { id ->
             WorkManager.getInstance(context).cancelUniqueWork("recording-upload-$id"); configured.remove(id)
         }
@@ -48,7 +53,9 @@ internal class RecordingAudioPush(
             request(c.id, c.subscription.audioWifiOnly))
     }
     suspend fun run(id: Long): Boolean = withContext(Dispatchers.IO) { locks.getOrPut(id) { Mutex() }.withLock {
-        val pair = try { channels.resolveAudio(id) } catch (_: Exception) {
+        val pair = try { channels.resolveAudio(id) } catch (caught: Exception) {
+            FailureNotes.record("recordings/RecordingAudioPush.kt:54", caught)
+
             val state = state(id); state.json.put("error", "云端存储未连接或通道配置冲突，请检查推送设置"); state.save()
             diagnostic(id, state, load()); revision.value++; return@withLock true
         }
@@ -86,7 +93,9 @@ internal class RecordingAudioPush(
             }
             false
         } catch (e: CancellationException) { throw e }
-        catch (_: Exception) { true }
+        catch (caught: Exception) {
+            FailureNotes.record("recordings/RecordingAudioPush.kt:92", caught)
+            true }
         finally { revision.value++; diagnostic(id, state, load()) }
     } }
     private fun diagnostic(id: Long, state: RecordingUploadState, rows: List<RecordingSource>) {
@@ -123,13 +132,22 @@ internal fun attachRecordingArchive(context: Context, database: CaptureDatabase,
     channels.audioPush = audio
     scope.launch(Dispatchers.IO) {
         merge(channels.channels.map { Unit }, database.invalidationTracker.createFlow("segments", "transcript_lines", "memory_events", "env_sounds").map { Unit },
-            flow { while (currentCoroutineContext().isActive) { emit(Unit); delay(60_000) } })
+            channelFlow { channels.channels.map { list -> BackgroundRefreshPolicy.audioNeedsTick(list) }
+                .refreshWhileNeeded(60_000) { send(Unit) } })
             .debounce(1000).collect { audio.refresh() }
     }
-    WorkManager.getInstance(context).enqueueUniquePeriodicWork("recording-audio-sweep", ExistingPeriodicWorkPolicy.KEEP,
-        PeriodicWorkRequestBuilder<RecordingAudioSweepWorker>(15, TimeUnit.MINUTES).build())
+    RecordingAudioSweepWorker.schedule(context, channels.channels.value)
 }
 class RecordingAudioSweepWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    companion object {
+        internal fun schedule(context: Context, channels: List<PushChannel>) {
+            val work = WorkManager.getInstance(context)
+            if (BackgroundRefreshPolicy.audioNeedsTick(channels))
+                work.enqueueUniquePeriodicWork("recording-audio-sweep", ExistingPeriodicWorkPolicy.KEEP,
+                    PeriodicWorkRequestBuilder<RecordingAudioSweepWorker>(15, TimeUnit.MINUTES).build())
+            else work.cancelUniqueWork("recording-audio-sweep")
+        }
+    }
     override suspend fun doWork(): Result {
         (AppGraph.push as? AndroidPushChannels)?.audioPush?.refresh() ?: return Result.retry()
         return Result.success()

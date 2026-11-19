@@ -1,5 +1,7 @@
 package app.resound.backup
 
+import app.resound.diagnostics.FailureNotes
+
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -21,6 +23,9 @@ internal fun backupError(e: Exception): BackupFailure = when (e) {
 }
 
 /** 不跟随重定向，防止认证头和备份被送往其他地址。所有路径由单个 segment 编码。 */
+/** 限流重试的等待；单测换成不等待 */
+internal var webDavPause: (Long) -> Unit = { Thread.sleep(it) }
+
 internal class WebDavClient(
     config: BackupConfig, @Suppress("UNUSED_PARAMETER") appName: String, account: String, password: String,
     private val client: OkHttpClient = OkHttpClient.Builder().followRedirects(false)
@@ -40,7 +45,15 @@ internal class WebDavClient(
     private fun request(method: String, target: HttpUrl, body: RequestBody? = null, headers: Map<String, String> = emptyMap()): Response {
         val request = Request.Builder().url(target).header("Authorization", auth).method(method, body)
         headers.forEach { (key, value) -> request.header(key, value) }
-        val response = client.newCall(request.build()).execute()
+        // 坚果云等免费账号按时段限次：429/503 先按服务端给的等待时间（没有就 5、15 秒）重试，最多 3 次，不让整次备份失败
+        var attempt = 0
+        var response = client.newCall(request.build()).execute()
+        while (!response.isSuccessful && response.code in setOf(429, 503) && attempt < 3) {
+            val wait = response.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1, 60) ?: listOf(5L, 15L, 30L)[attempt]
+            response.close(); attempt++
+            webDavPause(wait * 1000)
+            response = client.newCall(request.build()).execute()
+        }
         if (response.isSuccessful) return response
         val code = response.code
         response.close()
@@ -49,7 +62,8 @@ internal class WebDavClient(
             401, 403 -> BackupFailure("账号或应用密码不对")
             507 -> BackupFailure("${label}空间不足")
             404 -> BackupFailure("备份目录不存在")
-            408, 429, in 500..599 -> BackupFailure("${label}暂时不可用", true)
+            429 -> BackupFailure("${label}限流（请求太频繁），稍后自动重试", true)
+            408, in 500..599 -> BackupFailure("${label}服务器暂时出错，稍后自动重试", true)
             else -> BackupFailure("${label}操作失败")
         }
     }
@@ -61,7 +75,9 @@ internal class WebDavClient(
     /** 新目录 + 旧中文目录里的全部备份（恢复列表用），新的在前；新目录还没建时视为空 */
     override fun backups(): List<RemoteBackup> {
         fun quiet(dir: HttpUrl) = try { listIn(dir) } catch (e: BackupFailure) { if (e.human == "备份目录不存在") emptyList() else throw e }
-        return (quiet(directory) + runCatching { quiet(legacyDirectory) }.getOrDefault(emptyList()))
+        return (quiet(directory) + runCatching { quiet(legacyDirectory) }.onFailure {
+            FailureNotes.record("backup/WebDavClient.kt:64", it)
+        }.getOrDefault(emptyList()))
             .sortedWith(compareByDescending<RemoteBackup> { it.at }.thenByDescending { it.name })
     }
     private fun listIn(dir: HttpUrl): List<RemoteBackup> = listFilesIn(dir).mapNotNull { item ->
@@ -97,6 +113,8 @@ internal class WebDavClient(
                     "propstat" -> { inPropstat = true; propSuccess = false; propSize = 0L; propModified = 0L }
                     "getlastmodified" -> if (inResponse) propModified = runCatching {
                         java.time.ZonedDateTime.parse(parser.nextText(),java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli()
+                    }.onFailure {
+                        FailureNotes.record("backup/WebDavClient.kt:98", it)
                     }.getOrDefault(0L)
                     "getcontentlength" -> if (inResponse) propSize = parser.nextText().toLongOrNull()?.coerceAtLeast(0) ?: 0
                     "status" -> if (inResponse) {
@@ -132,7 +150,9 @@ internal class WebDavClient(
             request("MOVE", url(part), headers = mapOf("Destination" to url(name).toString(), "Overwrite" to "F")).close()
         } finally {
             // 仅清理本次临时文件；失败绝不触碰旧正式备份。
-            runCatching { delete(part) }
+            runCatching {
+                // 仅释放/清除临时资源；失败不改变已确定的业务结果，可忽略。
+                 delete(part) }
         }
     }
     /** 日记是固定路径的覆盖上传；与 ZIP 目录、保留策略分离。 */
@@ -206,7 +226,9 @@ internal class WebDavClient(
                     request("DELETE", destination).close()
                     request("MOVE", temporary, headers = mapOf("Destination" to destination.toString(), "Overwrite" to "F")).close()
                 }
-            } finally { runCatching { request("DELETE", temporary).close() } }
+            } finally { runCatching {
+                // 仅释放/清除临时资源；失败不改变已确定的业务结果，可忽略。
+                 request("DELETE", temporary).close() } }
         }
         override fun delete(path: String) { missing { request("DELETE", target(path)).close() } }
         override fun copy(from: String, to: String) {
@@ -220,7 +242,7 @@ internal class WebDavClient(
             return (known(directory)+known(legacyDirectory)).map { it.name }
         }
         override fun files(directory: String): List<VolumeFile> {
-            require(directory in setOf("history", "objects"))
+            require(directory in setOf("history", "objects", "device-archives"))
             val dir = this@WebDavClient.directory.newBuilder().addPathSegment(directory).addPathSegment("").build()
             return try { listFilesIn(dir).filter { volumePath("$directory/${it.path}") }.map { it.copy(path="$directory/${it.path}") } }
             catch(e: BackupFailure) { if(e.human=="备份目录不存在") emptyList() else throw e }

@@ -1,5 +1,10 @@
 package app.resound.skills
 
+// 同名类型与本文件声明或已有 import 冲突，以下引用保留全限定名：
+// app.resound.skills.core.SkillSchedule
+
+import kotlinx.datetime.toJavaLocalDate
+import kotlinx.datetime.toKotlinLocalDate
 import android.content.Context
 import androidx.work.*
 import app.resound.AppGraph
@@ -9,36 +14,14 @@ import java.time.LocalDate
 import java.util.concurrent.TimeUnit
 
 object SkillSchedule {
-    const val DAILY = "daily"
-    const val AFTER = "after_digest"
-    const val MANUAL = "manual"
-    const val TRIAL = "trial"
-    fun automatic(r: SkillRunRow) = r.kind == DAILY || r.kind == AFTER
-    fun date(at: Long): LocalDate = Instant.ofEpochMilli(at).atZone(SKILL_ZONE).toLocalDate()
-    fun autoCount(runs: List<SkillRunRow>, day: LocalDate) = runs.count { automatic(it) && date(it.at) == day }
-    /** 当天已错过但尚未跑的排到现在；只枚举今天及以后，不补昨天。 */
-    fun next(skill: Skill, runs: List<SkillRunRow>, now: Long, catchUp: Boolean = true): Long? {
-        val t = skill.trigger as? SkillTrigger.Daily ?: return null
-        if (!skill.enabled || skill.origin == SkillOrigin.Core) return null
-        val today = date(now)
-        for (offset in 0L..7L) {
-            val day = today.plusDays(offset)
-            if (t.weekdays.isNotEmpty() && day.dayOfWeek.value !in t.weekdays) continue
-            if (autoCount(runs, day) >= 6) continue
-            val time = day.atStartOfDay(SKILL_ZONE).plusMinutes(t.minutes.toLong()).toInstant().toEpochMilli()
-            val period = runs.filter { it.kind == DAILY && it.date == day.toEpochDay() }
-            if (period.isNotEmpty()) {
-                val last = period.last()
-                if (last.ok || !last.retryable || period.size >= 2) continue
-                val retry = maxOf(time, last.at + TimeUnit.MINUTES.toMillis(10))
-                if (date(retry) != day) continue
-                return maxOf(now, retry)
-            }
-            if (time > now) return time
-            if (catchUp && offset == 0L) return now
-        }
-        return null
-    }
+ const val DAILY = "daily"
+ const val AFTER = "after_digest"
+ const val MANUAL = "manual"
+ const val TRIAL = "trial"
+ fun automatic(r: SkillRunRow) = app.resound.skills.core.SkillSchedule.automatic(r.snapshot())
+ fun date(at: Long): LocalDate = app.resound.skills.core.SkillSchedule.date(at).toJavaLocalDate()
+ fun autoCount(runs: List<SkillRunRow>, day: LocalDate) = app.resound.skills.core.SkillSchedule.autoCount(runs.map { it.snapshot() }, day.toKotlinLocalDate())
+ fun next(skill: Skill, runs: List<SkillRunRow>, now: Long, catchUp: Boolean = true) = app.resound.skills.core.SkillSchedule.next(skill, runs.map { it.snapshot() }, now, catchUp)
 }
 
 class SkillScheduler(private val context: Context) {
@@ -60,6 +43,18 @@ class SkillScheduler(private val context: Context) {
             OneTimeWorkRequestBuilder<SkillAfterDigestWork>().setInputData(workDataOf(MANUAL to manual))
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build())
     }
+    /** 固定首次启动的两天，断点续做时不随日期滚动。完成标记独立于可清理的运行日志。 */
+    fun backfill207() {
+        val prefs = context.getSharedPreferences("skills-backfill-207", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("done", false)) return
+        if (!prefs.contains("day")) {
+            val day = app.resound.skills.core.SkillSchedule.date(System.currentTimeMillis()).toEpochDays().toLong()
+            check(prefs.edit().putLong("day", day).commit())
+        }
+        WorkManager.getInstance(context).enqueueUniqueWork("skills-backfill-207", ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<SkillBackfill207Work>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()).build())
+    }
     companion object { const val NAME = "skills-daily"; const val AFTER_NAME = "skills-after-digest"; const val MANUAL = "manual" }
 }
 class SkillWork(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -75,5 +70,22 @@ class SkillAfterDigestWork(context: Context, params: WorkerParameters) : Corouti
     override suspend fun doWork(): Result {
         (AppGraph.skills as LocalSkillRepository).afterDigest(inputData.getBoolean(SkillScheduler.MANUAL, false))
         return Result.success()
+    }
+}
+
+/** WorkManager 提供执行机会，业务筛选、门槛、日上限由共用仓储执行。 */
+class SkillBackfill207Work(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        val prefs = applicationContext.getSharedPreferences("skills-backfill-207", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("done", false)) return Result.success()
+        if (!prefs.contains("day")) return Result.failure()
+        val today = prefs.getLong("day", 0)
+        val repository = AppGraph.skills as LocalSkillRepository
+        val completed = app.resound.skills.core.MeetingBackfill207.run(today,
+            completed = { day -> prefs.getBoolean("day-$day", false) },
+            complete = { day -> prefs.edit().putBoolean("day-$day", true).commit() },
+            runDay = repository::backfillMeetings207)
+        if (!completed) return Result.retry()
+        return if (prefs.edit().putBoolean("done", true).commit()) Result.success() else Result.retry()
     }
 }

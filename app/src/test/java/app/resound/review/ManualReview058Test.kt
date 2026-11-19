@@ -1,5 +1,6 @@
 package app.resound.review
 
+import kotlinx.datetime.toKotlinLocalDate
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -45,10 +46,10 @@ class ManualReview058Test {
             override suspend fun send(title: String, body: String, deepLink: String?, topic: PushTopic?) {
                 error("手动不得推送")
             }
-        }, {}, now = { at + 22 * 3600000 }, zone = { zone }, beforeReview = { prepare() }, work = work)
+        }, {}, now = { at + 22 * 3600000 }, zone = { zone }, beforeReview = { prepare() }, work = work, io = kotlinx.coroutines.Dispatchers.IO)
 
     @Before fun setup() {
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         prefs.edit().clear().commit()
     }
@@ -59,7 +60,7 @@ class ManualReview058Test {
     }
     private fun assertEnded(r: RoomReviewRepository, error: String?) {
         assertEquals(error, r.state.value.lastError)
-        assertEquals(if (error == null) null else date, r.state.value.lastErrorDate)
+        assertEquals(if (error == null) null else date.toKotlinLocalDate(), r.state.value.lastErrorDate)
         assertFalse(r.state.value.generating)
         assertNull(r.state.value.stage)
     }
@@ -69,7 +70,7 @@ class ManualReview058Test {
         r.run(date, false)
         assertEnded(r, "10月28日 22:00 – 10月29日 22:00 没有可写进回顾的事")
         assertEquals(date.toString(), prefs.getString("lastErrorDate", null))
-        assertEquals(date, repo().state.value.lastErrorDate)
+        assertEquals(date.toKotlinLocalDate(), repo().state.value.lastErrorDate)
         r.run(date, true)
         assertEnded(r, null)
         assertEquals(0, calls)
@@ -135,9 +136,22 @@ class ManualReview058Test {
         modelId = "custom"
         r.run(date, false)
         assertEnded(r, null)
-        reply = { throw LlmException(LlmError.Network, detail = "密钥和服务原文") }
-        assertTrue(r.run(date, false))
-        assertEnded(r, LlmError.Network.human + "，稍后再试")
+        // 卡 103 转交 LlmClient 的安全 detail；从真实异常转换入口验证脱敏。
+        val http = okhttp3.OkHttpClient.Builder().addInterceptor {
+            throw java.net.UnknownHostException("密钥和服务原文")
+        }.build()
+        try {
+            reply = { LlmClient(http).chatJson(LlmPreset("custom", "测试", "https://example.invalid", "test"), "", "", "测试") }
+            assertTrue(r.run(date, false))
+            assertEnded(r, "找不到这个地址，请检查拼写")
+            assertFalse(prefs.all.toString().contains("密钥和服务原文"))
+            reply = { throw LlmException(LlmError.Network, detail = "找不到这个地址，请检查拼写；备用模型也没成功") }
+            assertTrue(r.run(date, false))
+            assertEnded(r, "找不到这个地址，请检查拼写；备用模型也没成功")
+        } finally {
+            http.dispatcher.executorService.shutdown()
+            http.connectionPool.evictAll()
+        }
         reply = { throw IllegalArgumentException("原文") }
         r.run(date, false)
         assertEnded(r, "生成失败，请稍后重试")

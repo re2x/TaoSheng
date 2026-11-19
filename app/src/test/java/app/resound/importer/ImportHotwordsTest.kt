@@ -33,7 +33,7 @@ class ImportHotwordsTest {
         context.getSharedPreferences("imports", 0).edit().clear().commit()
         context.getSharedPreferences("transcribe", 0).edit().clear().commit()
         File(context.cacheDir, "import").deleteRecursively()
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
     @After fun close() { scope.cancel(); db.close(); File(context.cacheDir, "import").deleteRecursively() }
@@ -131,7 +131,7 @@ class ImportHotwordsTest {
             val voiceprints = app.resound.voiceprint.LocalVoiceprintRepository(db, scope,
                 readPcm = { file -> assertTrue(file.exists()); ShortArray(32_000) { 2000 } },
                 createEngine = { app.resound.voiceprint.SpeakerEmbedding { FloatArray(192).apply { this[0] = 1f } } }, schedule = {})
-            val runner = TranscribeRunner(db.transcribe(), provider, { "test" }, { _, _ -> }, now = { clock }, deferAudioCleanup = true,
+            val runner = TranscribeRunner(db.transcribe(), provider, { "test" }, { _, _ -> }, now = { clock },
                 afterImport = { voiceprints.run(); voiceprints.cleanupAudio() })
             runner.run()
             val done = db.transcribe().observeSegments().first().single { it.path == files[0].path }
@@ -195,14 +195,8 @@ class ImportHotwordsTest {
         val request = JSONObject(String(DoubaoProtocol.config("pcm", words))).getJSONObject("request")
         val hotwords = JSONObject(request.getJSONObject("corpus").getString("context")).getJSONArray("hotwords")
         assertEquals(5000, hotwords.length()); assertEquals("手动词", hotwords.getJSONObject(0).getString("word"))
-        val file = File.createTempFile("custom", ".ogg", context.cacheDir)
-        try {
-            val body = customAsrBody(AsrAudio(file, "ogg", 1000), "test", words)
-            val part = body.parts.single { it.headers?.get("Content-Disposition")?.contains("name=\"prompt\"") == true }
-            val buffer = okio.Buffer(); part.body.writeTo(buffer)
-            val prompt = buffer.readUtf8()
-            assertTrue(prompt.startsWith("可能出现的词：手动词、自动词")); assertEquals(200, prompt.length)
-        } finally { file.delete() }
+        val prompt = Hotwords.customPrompt(words)
+        assertTrue(prompt.startsWith("可能出现的词：手动词、自动词")); assertEquals(200, prompt.length)
     }
 
     @Test fun digestInputAddsScopedCorrectionWithoutChangingOriginalLines() {

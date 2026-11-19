@@ -1,5 +1,7 @@
 package app.resound.audio
 
+import app.resound.diagnostics.FailureNotes
+
 import android.content.Context
 import android.content.SharedPreferences
 import android.media.AudioDeviceCallback
@@ -11,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.combine
 import app.resound.devices.*
+import app.resound.devices.android.DeviceInputs
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -23,7 +26,7 @@ internal class InputPreferences(private val prefs: SharedPreferences) {
         else -> InputChoice.Phone
     }
     fun write(choice: InputChoice) {
-        val edit = prefs.edit().clear()
+        val edit = prefs.edit().remove("key").remove("name")
         when (choice) {
             InputChoice.Phone -> edit.putString("choice", "phone")
             InputChoice.AutoExternal -> edit.putString("choice", "auto")
@@ -40,13 +43,13 @@ class AndroidInputDevices(context: Context) : InputDevices {
     private val catalog = InputCatalog()
     private var cardRoutes = emptyList<InputRoute>()
     private var onChoice: (InputChoice) -> Unit = {}
-    internal fun attachCards(devices: ManagedDevices, cards: DeviceCards, scope: CoroutineScope) {
+    internal fun attachCards(devices: DeviceInputs, cards: DeviceCards, scope: CoroutineScope) {
         onChoice = devices::select
         devices.select(choice.value)
         scope.launch {
             combine(devices.devices, cards.cards) { states, installed ->
-                states.filter { state -> installed.any { it.enabled && it.card.id == state.cardId && it.card.audio != null } }.map {
-                    InputRoute(InputDevice(ManagedDevices.deviceKey(it.address), it.name, InputKind.CardDevice,
+                states.filter { state -> devices.hasLiveInput(state.cardId, installed) }.map {
+                    InputRoute(InputDevice(DeviceInputs.deviceKey(it.address), it.name, InputKind.CardDevice,
                         it.status == DeviceStatus.Live || it.status == DeviceStatus.Backfilling))
                 }
             }.collect { routes -> synchronized(this@AndroidInputDevices) { cardRoutes = routes; refresh() } }
@@ -69,7 +72,9 @@ class AndroidInputDevices(context: Context) : InputDevices {
     }
     @Synchronized private fun refresh() {
         val ports = manager.getDevices(AudioManager.GET_DEVICES_INPUTS).map {
-            InputPort(it.id, it.type, it.productName.toString(), runCatching { it.address }.getOrDefault(""))
+            InputPort(it.id, it.type, it.productName.toString(), runCatching { it.address }.onFailure {
+                FailureNotes.record("audio/AndroidInputDevices.kt:73", it)
+            }.getOrDefault(""))
         }
         publish(catalog.update(ports) + cardRoutes)
     }

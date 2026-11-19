@@ -1,5 +1,11 @@
 package app.resound.digest
 
+import app.resound.data.saveDigest
+import app.resound.digest.core.DigestOutcome
+import app.resound.digest.core.DigestRecovery
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
 import android.content.Context
 import app.resound.appName
 import app.resound.data.MemoryDao
@@ -7,6 +13,7 @@ import app.resound.data.MemoryEventEntity
 import app.resound.data.MemoryItemEntity
 import app.resound.data.TranscriptLineEntity
 import app.resound.data.PendingDigest
+import app.resound.data.SegmentPlayback
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -14,7 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import org.json.JSONArray
 import java.time.LocalDate
 
-internal class DigestBatchLimitException : IllegalArgumentException("单段转写内容过长，请拆分后再整理")
+
 
 /**
  * 把已转写的句子整理成事件。按“段落”处理：相邻两句间隔超过停顿时长（默认 [GAP_MS]，可在设置里调）就算另一段；
@@ -38,9 +45,12 @@ class DigestRunner(
     private val afterDigest: suspend (Boolean) -> Unit = {},
     private val isMedia: suspend (Long, Long) -> Boolean = { _, _ -> false },
     private val unseparated: suspend (List<Long>) -> List<Long> = { emptyList() },
+    /** 片段编号 → 手机麦克风片段的外放毫秒数快照；空表示无外放资料（生产装配 [app.resound.data.TranscribeDao.playbackMillis]）。 */
+    private val playbackMillis: suspend (List<Long>) -> List<SegmentPlayback> = { emptyList() },
     private val thingExtraction: app.resound.things.DigestThingExtraction? = null,
     private val request: suspend (LlmPreset, String, String, String) -> LlmReply = settings.digestRequest(client),
     private val situation: app.resound.context.SituationLookup? = null,
+    private val marks: suspend (Long, Long) -> List<app.resound.marks.MarkRow> = { _, _ -> emptyList() },
 ) {
     private val diagnostics = app.resound.diagnostics.LlmDiagnostics(context)
     private val responseTraces = mutableMapOf<String, app.resound.diagnostics.LlmResponseTrace>()
@@ -64,9 +74,13 @@ class DigestRunner(
     /** 兼容旧调用的单次 force；生产流水线用 run 的显式参数，避免自动任务消费手动意图。 */
     @Volatile var forceOnce = false
 
-    /** true 表示有暂时性错误，希望稍后重试 */
-    suspend fun run(force: Boolean? = null, manual: Boolean = false): Boolean {
-        if (!gate.tryLock()) return false
+    /** true 表示有暂时性错误，希望稍后重试；保留已有调用语义。 */
+    suspend fun run(force: Boolean? = null, manual: Boolean = false): Boolean =
+        runOutcome(force, manual) is DigestOutcome.Retryable
+
+    /** 取消始终抛出，不把取消包装成正常返回，更不能发布成功。 */
+    internal suspend fun runOutcome(force: Boolean? = null, manual: Boolean = false): DigestOutcome {
+        if (!gate.tryLock()) return DigestOutcome.NothingToDo
         var madeEvents = false
         // force 只决定对话是否结束；manual 只决定技能是否跳过最短间隔。
         val forceNow = force ?: forceOnce.also { forceOnce = false }
@@ -75,51 +89,24 @@ class DigestRunner(
         probe = null
         try {
             val (preset, key) = synchronized(settings.providers.guard) { settings.preset to readKey() }
-            if (key.isBlank() && !settings.canUseWithoutKey(preset) && !settings.failover.hasBackup(preset)) { record(null, "还没填写大模型密钥"); return false }
-            unsavedReply?.let { dao.rememberDigest(it); unsavedReply = null; clearInFlight() }
+            if (key.isBlank() && !settings.canUseWithoutKey(preset) && !settings.failover.hasBackup(preset))
+                return needsUser("还没填写大模型密钥", null)
+            replayUnsavedReply()
             val undigested = dao.undigestedLines()
-            val chunks = mutableListOf<List<TranscriptLineEntity>>()
-            for (pending in dao.pendingDigests()) {
-                val source = dao.refreshLines(pending.ids())
-                // 核验不了的旧缓存与原逻辑一样丢弃、重新整理：多花一次请求，好过整理永久停住。
-                if (source.size == pending.ids().size && dao.topicLineCount(pending.ids()) == 0 && matches(pending, source, preset)) chunks += source
-                else dao.removePendingDigest(pending.id)
-            }
-            val inFlight = prefs.getString("inflight", null)
-            if (inFlight != null) {
-                val ids = prefs.getString("inflight-lines", "")!!.split(',').mapNotNull(String::toLongOrNull).toSet()
-                if (dao.pendingDigest(inFlight) != null || undigested.none { it.id in ids } || manual) {
-                    clearInFlight()
-                } else {
-                    record(now(), "上次整理结果未能保存，已暂停自动请求；请检查存储后点“现在整理”重试")
-                    return false
-                }
-            }
-            val replayIds = chunks.flatten().map { it.id }.toSet()
-            val sessions = sessions(undigested.filterNot { it.id in replayIds }, gapMillis())
-            for (session in sessions) {
-                val ready = if (closed(session, forceNow)) session else settledPrefix(session)
-                chunks.addAll(batches(ready))
-            }
+            val chunks = verifiedPendingChunks(preset)
+            if (!resolveInFlight(undigested, manual))
+                return needsUser("上次整理结果未能保存，已暂停自动请求；请检查存储后点“现在整理”重试")
+            appendReadyChunks(chunks, undigested, forceNow)
             _progress.value = _progress.value.copy(total = chunks.sumOf { it.size }, batches = chunks.size)
-            for ((index, chunk) in chunks.withIndex()) {
-                if (!networkAllowed() && cached(chunk, preset) == null) { record(now(), "等待网络"); return true }
-                _progress.value = _progress.value.copy(batch = index + 1, batchStartedAt = elapsed())
-                val refreshed = dao.refreshLines(chunk.map { it.id })
-                when (val outcome = if (refreshed.isEmpty()) null else digest(refreshed, preset, key) { madeEvents = true }) {
-                    null -> _progress.value = _progress.value.copy(done = _progress.value.done + chunk.size)
-                    LlmError.Auth, LlmError.Quota -> { record(now(), failureDetail ?: outcome.human); return false }
-                    LlmError.Network, LlmError.Server, LlmError.RateLimit, LlmError.Format -> { record(now(), failureDetail ?: outcome.human); return retryFailure }
-                }
-            }
-            record(now(), null)
-            return false
+            val result = runBatches(chunks, preset, key) { madeEvents = true }
+            currentCoroutineContext().ensureActive()
+            if (result == DigestOutcome.Done || result == DigestOutcome.NothingToDo) record(now(), null)
+            return result
         } catch (e: CancellationException) { throw e }
-        catch (e: LlmInputLimitException) { record(now(), e.message); return false }
-        catch (e: DigestBatchLimitException) { record(now(), e.message); return false }
+        catch (e: LlmInputLimitException) { return needsUser(e.message.orEmpty()) }
+        catch (e: DigestBatchLimitException) { return needsUser(e.message.orEmpty()) }
         catch (_: Exception) {
-            record(now(), "整理的本地数据暂时无法读取或保存，请检查存储后重试")
-            return false
+            return needsUser("整理的本地数据暂时无法读取或保存，请检查存储后重试")
         } finally {
             _progress.value = _progress.value.copy(finishedAt = elapsed())
             _running.value = false
@@ -131,6 +118,68 @@ class DigestRunner(
                 catch (_: Exception) { /* 技能调度失败不影响已完成的整理。 */ }
             }
         }
+    }
+
+    private fun needsUser(reason: String, at: Long? = now()): DigestOutcome.NeedsUser {
+        record(at, reason)
+        return DigestOutcome.NeedsUser(reason)
+    }
+
+    private suspend fun replayUnsavedReply() {
+        // rememberDigest 可能返回 false（来源已删除）；必须等调用完成后才能清内存与在途状态。
+        unsavedReply?.let { dao.rememberDigest(it); unsavedReply = null; clearInFlight() }
+    }
+
+    private suspend fun verifiedPendingChunks(preset: LlmPreset): MutableList<List<TranscriptLineEntity>> {
+        val chunks = mutableListOf<List<TranscriptLineEntity>>()
+        for (pending in dao.pendingDigests()) {
+            val source = dao.refreshLines(pending.ids())
+            // 保留短路顺序：来源不完整时不再查主题或核对模型。
+            if (source.size == pending.ids().size && dao.topicLineCount(pending.ids()) == 0 && matches(pending, source, preset))
+                chunks += source
+            else dao.removePendingDigest(pending.id)
+        }
+        return chunks
+    }
+
+    private suspend fun resolveInFlight(undigested: List<TranscriptLineEntity>, manual: Boolean): Boolean {
+        val inFlight = prefs.getString("inflight", null) ?: return true
+        val ids = prefs.getString("inflight-lines", "")!!.split(',').mapNotNull(String::toLongOrNull).toSet()
+        if (!DigestRecovery.mayClearInFlight(dao.pendingDigest(inFlight) != null,
+                undigested.none { it.id in ids }, manual)) return false
+        clearInFlight()
+        return true
+    }
+
+    private suspend fun appendReadyChunks(chunks: MutableList<List<TranscriptLineEntity>>,
+                                          undigested: List<TranscriptLineEntity>, force: Boolean) {
+        val replayIds = chunks.flatten().map { it.id }.toSet()
+        for (session in sessions(undigested.filterNot { it.id in replayIds }, gapMillis())) {
+            val ready = if (closed(session, force)) session else settledPrefix(session)
+            chunks.addAll(batches(ready))
+        }
+    }
+
+    private suspend fun runBatches(chunks: List<List<TranscriptLineEntity>>, preset: LlmPreset,
+                                   key: String, onEvents: () -> Unit): DigestOutcome {
+        for ((index, chunk) in chunks.withIndex()) {
+            if (!networkAllowed() && cached(chunk, preset) == null) {
+                record(now(), "等待网络")
+                return DigestOutcome.Retryable("等待网络")
+            }
+            _progress.value = _progress.value.copy(batch = index + 1, batchStartedAt = elapsed())
+            val refreshed = dao.refreshLines(chunk.map { it.id })
+            when (val error = if (refreshed.isEmpty()) null else digest(refreshed, preset, key, onEvents)) {
+                null -> _progress.value = _progress.value.copy(done = _progress.value.done + chunk.size)
+                LlmError.Auth, LlmError.Quota -> return needsUser(failureDetail ?: error.human)
+                LlmError.Network, LlmError.Server, LlmError.RateLimit, LlmError.Format -> {
+                    val reason = failureDetail ?: error.human
+                    record(now(), reason)
+                    return if (retryFailure) DigestOutcome.Retryable(reason) else DigestOutcome.NeedsUser(reason)
+                }
+            }
+        }
+        return if (chunks.isEmpty()) DigestOutcome.NothingToDo else DigestOutcome.Done
     }
 
     internal suspend fun withIdle(block: suspend () -> Unit) { gate.lock(); try { block() } finally { gate.unlock() } }
@@ -162,7 +211,9 @@ class DigestRunner(
         val batchId = identity(lines)
         var storedId = batchId
         return try {
-            val contextPrompt = SituationPrompt(settings.includeSituation.value, situation)
+            val recordings = playbackMillis(lines.map { it.segmentId }.distinct())
+            val contextPrompt = SituationPrompt(settings.includeSituation.value, situation,
+                recordings.associate { it.id to it.playbackMillis }, marks, recordings)
             val (text, indexed) = contextPrompt.transcript(lines, unseparated = unseparated(lines.map { it.segmentId }.distinct()).toSet())
             val unfinished = dao.unfinishedForDigest()
             val candidates = unfinished.map { it.id }.toSet()
@@ -201,9 +252,9 @@ class DigestRunner(
             val (events, items) = DigestPrompt.parse(reply.content, indexed, diagnostics = trace)
             val at = now()
             val save: suspend () -> Unit = { dao.saveDigest(
-                events = events.map { e ->
+                events = events.mapIndexed { eventIndex, e ->
                     MemoryEventEntity(
-                        startAt = e.startAt, endAt = e.endAt, scene = if (isMedia(e.startAt, e.endAt)) "媒体" else e.scene, title = e.title, summary = e.summary,
+                        startAt = e.startAt, endAt = e.endAt, scene = if (items.none { it.eventIndex == eventIndex && it.category in setOf("待办", "约定") } && isMedia(e.startAt, e.endAt)) "媒体" else e.scene, title = e.title, summary = e.summary,
                         pointsJson = JSONArray(e.points).toString(), peopleJson = JSONArray(e.people).toString(),
                         place = e.place, emotion = e.emotion, intensity = e.intensity, important = e.important,
                         createdAt = at, model = actualModels[stored.id] ?: preset.model,
@@ -300,41 +351,12 @@ class DigestRunner(
 
     private fun gapMillis() = settings.pauseMinutes.value * 60_000L
 
-    internal suspend fun closed(session: List<TranscriptLineEntity>, force: Boolean): Boolean {
-        val gap = gapMillis()
-        if (voiceprintReady() && dao.voiceprintPending(session.map { it.segmentId }.distinct()) > 0) return false
-        val start = session.first().startAt
-        val end = session.maxOf { it.endAt }
-        val quietLongEnough = force || now() - end >= gap
-        return quietLongEnough && dao.unfinishedSegments(start - gap, if (force) end else end + gap) == 0
-    }
+    private val windows = DigestWindows(RoomDigestWindowStore(dao), app.resound.platform.NowMillis(now))
+    internal suspend fun closed(session: List<TranscriptLineEntity>, force: Boolean): Boolean =
+        windows.closed(session.map { it.snapshot() }, force, gapMillis(), voiceprintReady())
 
-
-    /**
-     * 段落还没结束但已经说了很久：只看已过去停顿时长的句子（后面不会再插进新句子），
-     * 前半截至少一个停顿时长那么长，在其中最长的停顿处切开，返回可以先整理的前半截；不满足返回空。
-     */
-    internal suspend fun settledPrefix(session: List<TranscriptLineEntity>): List<TranscriptLineEntity> {
-        val start = session.first().startAt
-        val gap = gapMillis()
-        val settled = now() - gap
-        if (settled - start < settings.maxWaitMinutes.value * 60_000L) return emptyList()
-        var cut = -1
-        var bestGap = -1L
-        var prefixEnd = Long.MIN_VALUE
-        for (i in 0 until session.size - 1) {
-            prefixEnd = maxOf(prefixEnd, session[i].endAt)
-            if (prefixEnd > settled) break
-            if (prefixEnd - start < gap) continue
-            val pause = session[i + 1].startAt - prefixEnd
-            if (pause >= bestGap) { bestGap = pause; cut = i }
-        }
-        if (cut < 0) return emptyList()
-        val prefix = session.subList(0, cut + 1)
-        if (voiceprintReady() && dao.voiceprintPending(prefix.map { it.segmentId }.distinct()) > 0) return emptyList()
-        val end = prefix.maxOf { it.endAt }
-        return if (dao.unfinishedSegments(start - gap, end) == 0) prefix else emptyList()
-    }
+    internal suspend fun settledPrefix(session: List<TranscriptLineEntity>): List<TranscriptLineEntity> =
+        session.take(windows.settledPrefixSize(session.map { it.snapshot() }, gapMillis(), settings.maxWaitMinutes.value * 60_000L, voiceprintReady()))
 
     private fun failed(firstLineId: Long): Int {
         val n = prefs.getInt("fail-$firstLineId", 0) + 1
@@ -364,29 +386,8 @@ class DigestRunner(
         /** 每句除正文外的编号、时间、说话人（如“[123] 12:34:56 说话人1：”）约 20 字，留点余量 */
         const val LINE_OVERHEAD_CHARS = 30
 
-        internal fun batches(lines: List<TranscriptLineEntity>): List<List<TranscriptLineEntity>> {
-            val chunks = mutableListOf<MutableList<TranscriptLineEntity>>()
-            var chars = 0
-            for (line in lines) {
-                val size = line.text.length + LINE_OVERHEAD_CHARS
-                if (size > MAX_BATCH_CHARS) throw DigestBatchLimitException()
-                if (chunks.isEmpty() || chunks.last().size >= MAX_LINES || chars + size > MAX_BATCH_CHARS) {
-                    chunks += mutableListOf<TranscriptLineEntity>(); chars = 0
-                }
-                chunks.last() += line; chars += size
-            }
-            return chunks
-        }
+        internal fun batches(lines: List<TranscriptLineEntity>) = DigestBatches.batches(lines) { it.text }
+        fun sessions(lines: List<TranscriptLineEntity>, gapMillis: Long = GAP_MS) = DigestBatches.sessions(lines, gapMillis, { it.startAt }, { it.endAt })
 
-        /** 按时间间隔分段 */
-        fun sessions(lines: List<TranscriptLineEntity>, gapMillis: Long = GAP_MS): List<List<TranscriptLineEntity>> {
-            val out = mutableListOf<MutableList<TranscriptLineEntity>>()
-            for (line in lines) {
-                val current = out.lastOrNull()
-                if (current != null && line.startAt - current.maxOf { it.endAt } <= gapMillis) current += line
-                else out += mutableListOf(line)
-            }
-            return out
-        }
     }
 }

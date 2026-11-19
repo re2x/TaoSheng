@@ -1,5 +1,8 @@
 package app.resound.envsound
 
+import kotlinx.datetime.toKotlinLocalDate
+import app.resound.data.testSql
+import kotlinx.datetime.toKotlinLocalDate
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -20,6 +23,7 @@ import java.time.*
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk=[29], manifest=Config.NONE, application=Application::class)
 class EnvSound070Test {
+    @get:Rule val envSoundScope = app.resound.envsound.AppGraphEnvSoundRule()
     private val context get() = RuntimeEnvironment.getApplication() as Context
     private lateinit var db: CaptureDatabase
     private lateinit var scope: CoroutineScope
@@ -35,11 +39,11 @@ class EnvSound070Test {
     private fun score(vararg pairs: Pair<String,Float>): Map<String,Float> =
         (EnvSoundRules.speech + EnvSoundRules.human + EnvSoundRules.tags.values.flatMap { it.second } + EnvSoundRules.sounds.values.flatMap { it.second }).associateWith { 0f } + pairs
     @Before fun setup() {
-        db=Room.inMemoryDatabaseBuilder(context,CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db=Room.inMemoryDatabaseBuilder(context,CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope=CoroutineScope(SupervisorJob()+Dispatchers.Unconfined)
         dir=File(context.cacheDir,"env070").apply { mkdirs() }
         val prefs=context.getSharedPreferences("env070",0);prefs.edit().clear().commit()
-        repo=LocalEnvSoundRepository(db,prefs,scope,state,{}, { calls++;EnvSoundEvidence(scores, scores, 32000, 32000) to false }, { queued++ },now={clock})
+        repo=LocalEnvSoundRepository(db,prefs,scope,state,{}, { calls++;EnvSoundEvidence(scores, scores, 32000, 32000) to false }, { queued++ },now={clock},zoneProvider=app.resound.platform.SystemZone, io = kotlinx.coroutines.Dispatchers.IO)
     }
     @After fun close() { scope.cancel();db.close();dir.deleteRecursively() }
     private suspend fun segment(id: Long, start: Long=clock, duration: Long=60000): SegmentEntity {
@@ -50,7 +54,7 @@ class EnvSound070Test {
         override suspend fun recognize(audio: AsrAudio,key: String,beforeAudio: suspend () -> Unit): AsrResult {
             asr++;beforeAudio();return AsrResult(emptyList(),audio.durationMillis,null)
         }
-    },{"key"},{_,_->},now={clock},deferAudioCleanup=true,beforeTranscribe=repo::beforeTranscribe)
+    },{"key"},{_,_->},now={clock},beforeTranscribe=repo::beforeTranscribe)
     @Test fun pureMusicAndSpeechAndHumanProtection() {
         assertEquals(SegmentVerdict.Skippable,EnvSoundRules.decide(scores,enabled,false).verdict)
         assertEquals(SegmentVerdict.Keep,EnvSoundRules.decide(score("Speech" to .9f),enabled,false).verdict)
@@ -109,7 +113,7 @@ class EnvSound070Test {
         repo.update(enabled);state.value=EnvModelState.NotDownloaded;segment(2);runner().run();assertEquals(0,calls)
         state.value=EnvModelState.Ready;segment(3,clock-1);runner().run();assertEquals(0,calls)
         assertEquals(3,asr)
-        val failure=LocalEnvSoundRepository(db,context.getSharedPreferences("env070",0),scope,state,{}, { error("decode") },{})
+        val failure=LocalEnvSoundRepository(db,context.getSharedPreferences("env070",0),scope,state,{}, { error("decode") },{},zoneProvider=app.resound.platform.SystemZone, now = app.resound.platform.SystemNow::now, io = kotlinx.coroutines.Dispatchers.IO)
         segment(4);assertFalse(failure.beforeTranscribe(db.transcribe().segment(4)))
     }
     @Test fun aggregationSplitsHoursAndMergesEvents(): Unit = runBlocking {
@@ -117,13 +121,13 @@ class EnvSound070Test {
         clock=start;repo.update(enabled);scores=score("Speech" to .9f,"Rain" to .4f,"Knock" to .4f)
         segment(1,start,120000);runner().run()
         val id=db.memory().insertEvent(MemoryEventEntity(startAt=start,endAt=start+120000,scene="其他",title="事",summary="",pointsJson="[]",peopleJson="[]",place=null,emotion=null,intensity=null,important=false,createdAt=start,model="test"))
-        val merged=withTimeout(5000) { repo.eventSounds(date).first { id in it } }.getValue(id)
+        val merged=withTimeout(5000) { repo.eventSounds(date.toKotlinLocalDate()).first { id in it } }.getValue(id)
         assertEquals(setOf(EnvTag.Rain),merged.tags);assertEquals(setOf(SpecialSound.Knock),merged.sounds)
         assertEquals(listOf(id),repo.eventsWith(EnvTag.Rain,SpecialSound.Knock).first())
-        val hours=repo.hourly(date).first();assertEquals(listOf(10,11),hours.map { it.hour });assertEquals(listOf(1,1),hours.map { it.speechMinutes })
+        val hours=repo.hourly(date.toKotlinLocalDate()).first();assertEquals(listOf(10,11),hours.map { it.hour });assertEquals(listOf(1,1),hours.map { it.speechMinutes })
         db.privacy().deleteSegment(1)
-        withTimeout(5000) { repo.eventSounds(date).first { it.isEmpty() } }
-        withTimeout(5000) { repo.hourly(date).first { it.isEmpty() } }
+        withTimeout(5000) { repo.eventSounds(date.toKotlinLocalDate()).first { it.isEmpty() } }
+        withTimeout(5000) { repo.hourly(date.toKotlinLocalDate()).first { it.isEmpty() } }
     }
     @Test fun skippedAudioHasOneDayFloorAndClearKeepsDecision() = runBlocking {
         repo.update(enabled.copy(skip=SkipMode.On));segment(1);runner().run()
@@ -134,15 +138,15 @@ class EnvSound070Test {
     }
     @Test fun reviewAndWeeklyPresentationObeyToggleWithoutChangingStoredSummary() = runBlocking {
         val date=LocalDate.of(2026,10,29)
-        clock=date.atTime(10,0).atZone(app.resound.skills.SKILL_ZONE).toInstant().toEpochMilli()
+        clock=date.atTime(10,0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
         repo.update(enabled);scores=score("Speech" to .9f,"Rain" to .4f,"Knock" to .4f)
         segment(1);runner().run()
         val id=db.memory().insertEvent(MemoryEventEntity(startAt=clock,endAt=clock+60000,scene="其他",title="事情",summary="原摘要",pointsJson="[]",peopleJson="[]",place=null,emotion=null,intensity=null,important=false,createdAt=clock,model="test"))
-        withTimeout(3000) { repo.presentation.first { id in it };repo.eventMetadata.first { it.any { e -> e.id == id } } }
+        withTimeout(3000) { repo.eventSounds(date.toKotlinLocalDate()).first { id in it } }
         app.resound.AppGraph.envSound=repo
-        val review=app.resound.review.DailyReview(date,"摘要",listOf(app.resound.review.ReviewSection("发生了什么",listOf("事情"),listOf(id))),clock)
+        val review=app.resound.review.DailyReview(date.toKotlinLocalDate(),"摘要",listOf(app.resound.review.ReviewSection("发生了什么",listOf("事情"),listOf(id))),clock)
         assertTrue(EnvSoundPresentation.decorate(review).sections[0].lines[0].contains("期间有敲门声"))
-        val card=app.resound.skills.SkillCard(1,"weekly","周回顾","",date,clock,null,"标题","摘要",emptyList(),emptyMap(),emptyList(),clock,false)
+        val card=app.resound.skills.SkillCard(1,"weekly","周回顾","",date.toKotlinLocalDate(),clock,null,"标题","摘要",emptyList(),emptyMap(),emptyList(),clock,false)
         assertEquals(listOf("敲门声", "雨"), EnvSoundPresentation.decorate(card).values.getValue("env_sound_impression").items)
         val overview = EnvSoundPresentation.weekly(card, listOf(
             EventSounds(id,setOf(EnvTag.Rain),setOf(SpecialSound.Knock),false),
@@ -159,7 +163,7 @@ class EnvSound070Test {
     }
     @Test fun migration22PreservesSegmentAndCascadesJudgment() = runBlocking {
         val name="migration070.db";context.deleteDatabase(name)
-        val schema=JSONObject(File("schemas/app.resound.data.CaptureDatabase/22.json").readText()).getJSONObject("database")
+        val schema=JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/22.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name,0,null).use { old ->
             val entities=schema.getJSONArray("entities")
             for(i in 0 until entities.length()) {
@@ -173,12 +177,12 @@ class EnvSound070Test {
             old.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(1,1,2,'mic','/old',1,'Pending')")
             old.version=22
         }
-        val migrated=Room.databaseBuilder(context,CaptureDatabase::class.java,name).allowMainThreadQueries().addMigrations(*CaptureDatabase.MIGRATIONS).build()
+        val migrated=Room.databaseBuilder(context,CaptureDatabase::class.java,name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION,migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION,migrated.testSql.version)
             assertEquals("Pending",migrated.transcribe().segment(1).status)
             migrated.envSound().insert(EnvSoundRow(1,1,2,"/old","Keep",null,"","","{}",false,false))
-            migrated.openHelper.writableDatabase.execSQL("DELETE FROM segments WHERE id=1")
+            migrated.testSql.execSQL("DELETE FROM segments WHERE id=1")
             assertNull(migrated.envSound().get(1))
         } finally { migrated.close();context.deleteDatabase(name) }
     }

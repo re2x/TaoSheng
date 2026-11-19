@@ -1,5 +1,6 @@
 package app.resound.ui.verify
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.ui.unit.sp
 import app.resound.appDisplayName
@@ -52,7 +53,6 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -62,6 +62,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import app.resound.ui.settings.settingsAnchor
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -91,33 +93,92 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-/** 录音与后台页：录音状态、当天统计、守护记录、小米设置引导。 */
+/**
+ * 录音与后台页（11-12 精简）：状态、停录时段、录音来源（设备改成一行入口）、导入、后台。
+ * 统计、守护记录、麦克风占用、导出收进“高级与诊断”；外接设备有自己的页。
+ */
 @Composable
 fun VerifyScreen(
     capture: CaptureController,
     stats: CaptureStatsRepository,
     setup: SetupGuide,
-    themeMode: ThemeMode,
-    onThemeMode: (ThemeMode) -> Unit,
+    bottomPadding: androidx.compose.ui.unit.Dp,
 ) {
+    val c = Rs.colors
+    val g = app.resound.AppGraph
+    // 设置搜索命中时先滚到对应区块（区块自己再亮一下描边）
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val order = buildList {
+        add(listOf("permissions", "pause-length", "playback"))
+        if (g.isQuietScheduleReady) add(listOf("quiet"))
+        if (g.isInputsReady) add(listOf("input"))
+        if (g.isDevicesReady) add(emptyList())
+        if (g.isVoiceInputReady) add(listOf("voice-input"))
+        if (g.isFolderImportReady) add(listOf("folder-import"))
+        add(listOf("battery"))
+    }
+    val anchor = app.resound.ui.settings.SettingsHighlight.anchor
+    LaunchedEffect(anchor) { order.indexOfFirst { anchor in it }.takeIf { it >= 0 }?.let { listState.animateScrollToItem(it) } }
+    LazyColumn(
+        Modifier.fillMaxSize().background(c.background),
+        state = listState,
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottomPadding + 24.dp),
+        verticalArrangement = Arrangement.spacedBy(22.dp),
+    ) {
+        item { Box(Modifier.settingsAnchor("permissions", "pause-length", "playback")) { StatusCard(capture) } }
+        if (g.isQuietScheduleReady) item { Box(Modifier.settingsAnchor("quiet")) { QuietSection(g.quietSchedule) } }
+        if (g.isInputsReady) item { Box(Modifier.settingsAnchor("input")) { InputSection(g.inputs) } }
+        if (g.isDevicesReady) item {
+            LinkRow("外接设备", devicesSummary()) { app.resound.ui.ShellNav.openSettings(app.resound.ui.settings.SettingsPage.Devices) }
+        }
+        if (g.isVoiceInputReady) item { Box(Modifier.settingsAnchor("voice-input")) { VoiceInputSection(g.voiceInput) } }
+        if (g.isFolderImportReady) item { Box(Modifier.settingsAnchor("folder-import")) { FolderImportSection(g.folderImports) } }
+        item { Box(Modifier.settingsAnchor("battery")) { SetupSection(setup) } }
+        item { Box(Modifier.settingsAnchor("wake-word")) { WakeWordSection() } }
+        if (app.resound.AppGraph.isMarksReady) item { Box(Modifier.settingsAnchor("marks")) { MarkRangeSection() } }
+        item { LinkRow("运行记录与诊断", "统计 · 守护 · 麦克风占用") { app.resound.ui.ShellNav.openSettings(app.resound.ui.settings.SettingsPage.Advanced) } }
+    }
+}
+
+/** 外接设备页：原来夹在“录音与后台”里，11-12 单独成页 */
+@Composable
+fun DevicesPage(bottomPadding: androidx.compose.ui.unit.Dp) {
+    val c = Rs.colors
+    LazyColumn(
+        Modifier.fillMaxSize().background(c.background),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottomPadding + 24.dp),
+        verticalArrangement = Arrangement.spacedBy(22.dp),
+    ) {
+        if (app.resound.AppGraph.isDevicesReady) item { DeviceSection(app.resound.AppGraph.devices, app.resound.AppGraph.deviceCards, app.resound.AppGraph.deviceScanError) }
+        else item { Text("设备功能准备中", style = RsType.subhead, color = c.textTertiary, modifier = Modifier.padding(4.dp)) }
+    }
+}
+
+/** 设置首页和录音页上“外接设备”一行右侧的状态：“TaoEcho 已连接”“未连接”“已添加 2 个” */
+@Composable
+fun devicesSummary(): String {
+    if (!app.resound.AppGraph.isInputsReady) return "未连接"
+    val status by app.resound.AppGraph.inputs.status.collectAsStateWithLifecycle()
+    val using = status.using
+    return if (using.kind != app.resound.audio.InputKind.Phone) "${using.name} 已连接" else "未连接"
+}
+
+/** 高级与诊断：整理要求（提示词）、每日统计、守护记录、麦克风占用、导出 */
+@Composable
+fun AdvancedPage(stats: CaptureStatsRepository, bottomPadding: androidx.compose.ui.unit.Dp) {
     val c = Rs.colors
     var dayOffset by remember { mutableIntStateOf(0) }
     val date = remember(dayOffset) { LocalDate.now().minusDays(dayOffset.toLong()) }
-    val day by remember(date) { stats.dayStats(date) }.collectAsState(initial = null)
-    val events by remember(date) { stats.watchdogEvents(date) }.collectAsState(initial = emptyList())
-
+    val day by remember(date) { stats.dayStats(date) }.collectAsStateWithLifecycle(initialValue = null)
+    val events by remember(date) { stats.watchdogEvents(date) }.collectAsStateWithLifecycle(initialValue = emptyList())
     LazyColumn(
-        Modifier.fillMaxSize().background(c.background).windowInsetsPadding(WindowInsets.safeDrawing),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 40.dp + app.resound.ui.ShellBottomPadding),
+        Modifier.fillMaxSize().background(c.background),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottomPadding + 24.dp),
         verticalArrangement = Arrangement.spacedBy(22.dp),
     ) {
-        item { Header(themeMode, onThemeMode) }
-        item { StatusCard(capture) }
-        if (app.resound.AppGraph.isQuietScheduleReady) item { QuietSection(app.resound.AppGraph.quietSchedule) }
-        if (app.resound.AppGraph.isInputsReady) item { InputSection(app.resound.AppGraph.inputs) }
-        if (app.resound.AppGraph.isDevicesReady) item { DeviceSection(app.resound.AppGraph.devices, app.resound.AppGraph.deviceCards, app.resound.AppGraph.deviceScanError) }
-        if (app.resound.AppGraph.isVoiceInputReady) item { VoiceInputSection(app.resound.AppGraph.voiceInput) }
-        if (app.resound.AppGraph.isFolderImportReady) item { FolderImportSection(app.resound.AppGraph.folderImports) }
+        if (app.resound.AppGraph.isPromptsReady) item {
+            LinkRow("整理要求", "整理时给模型的指令") { app.resound.ui.ShellNav.openSettings(app.resound.ui.settings.SettingsPage.Prompts) }
+        }
         item {
             Section("每日统计") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -127,23 +188,23 @@ fun VerifyScreen(
             }
         }
         item { WatchdogSection(remember(events) { compactEvents(events.sortedByDescending { it.at }) }) }
-        item { SetupSection(setup) }
         item { MicHolderSection() }
         item { ExportRow(stats) }
     }
 }
 
+/** 一行入口卡片：标题 + 右侧状态 + › */
 @Composable
-private fun Header(themeMode: ThemeMode, onThemeMode: (ThemeMode) -> Unit) {
+fun LinkRow(title: String, value: String, onClick: () -> Unit) {
     val c = Rs.colors
-    val today = remember { LocalDate.now().format(DateTimeFormatter.ofPattern("M月d日 EEEE", Locale.CHINA)) }
-    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.Bottom) {
-        Column(Modifier.weight(1f)) {
-            Text(today, style = RsType.subhead, color = c.textSecondary)
-            Spacer(Modifier.height(2.dp))
-            Text(stringResource(R.string.app_name), style = RsType.largeTitle, color = c.text)
+    RsCard(padding = PaddingValues(0.dp)) {
+        Row(Modifier.fillMaxWidth().springClick(onClick).padding(horizontal = 18.dp, vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = RsType.body, color = c.text, maxLines = 1)
+            Text(value, style = RsType.subhead, color = c.textTertiary, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                textAlign = androidx.compose.ui.text.style.TextAlign.End, modifier = Modifier.weight(1f).padding(start = 12.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("›", style = RsType.headline.copy(fontWeight = FontWeight.Normal), color = c.textTertiary)
         }
-        ThemeModePill(themeMode, onThemeMode)
     }
 }
 
@@ -205,7 +266,8 @@ private fun ThemeIcon(mode: ThemeMode, ink: Color, paper: Color, modifier: Modif
 private fun StatusCard(capture: CaptureController) {
     val c = Rs.colors
     val context = LocalContext.current
-    val status by capture.status.collectAsState()
+    val status by capture.status.collectAsStateWithLifecycle()
+    val micLevel by capture.level.collectAsStateWithLifecycle(0f)
     val active = status.state == CaptureState.Listening || status.state == CaptureState.Recording
     val recording = status.state == CaptureState.Recording
 
@@ -250,7 +312,9 @@ private fun StatusCard(capture: CaptureController) {
                 label = "stateTitle",
             ) { Text(it, style = RsType.headline, color = c.text) }
             Spacer(Modifier.weight(1f))
-            Text(status.sourceName, style = RsType.caption, color = c.textTertiary)
+            val sourceName = if (app.resound.AppGraph.isInputsReady)
+                app.resound.AppGraph.inputs.status.collectAsStateWithLifecycle().value.using.name else status.sourceName
+            Text(sourceName, style = RsType.caption, color = c.textTertiary)
         }
         Spacer(Modifier.height(4.dp))
         Text(
@@ -260,7 +324,7 @@ private fun StatusCard(capture: CaptureController) {
             modifier = Modifier.padding(start = 17.dp),
         )
         BreathingWave(
-            level = status.level,
+            level = micLevel,
             active = active,
             recording = recording,
             modifier = Modifier.fillMaxWidth().height(84.dp).padding(vertical = 10.dp),
@@ -305,11 +369,11 @@ private fun stateDetail(state: CaptureState, elapsed: Long, pausedUntil: Long?, 
 fun DaySwitcher(selected: Int, compact: Boolean = false, onSelect: (Int) -> Unit) {
     val c = Rs.colors
     Row(
-        Modifier.clip(CircleShape).background(c.separator.copy(alpha = if (c.isDark) 1f else 0.7f)).padding(3.dp),
+        Modifier.clip(CircleShape).background(c.track).padding(3.dp),
     ) {
         listOf("今天", "昨天", "前天").forEachIndexed { i, label ->
             val on = i == selected
-            val bg by animateColorAsState(if (on) c.card else c.card.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "seg")
+            val bg by animateColorAsState(if (on) c.trackThumb else c.trackThumb.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "seg")
             Box(
                 Modifier.clip(CircleShape).background(bg).springClick { onSelect(i) }.padding(horizontal = if (compact) 12.dp else 18.dp, vertical = if (compact) 4.dp else 7.dp),
             ) {
@@ -516,6 +580,11 @@ private fun SetupSection(setup: SetupGuide) {
     Section("后台设置", trailing = {
         Text("$doneCount / ${items.size} 已完成", style = RsType.caption, color = if (doneCount == items.size) c.good else c.accent)
     }) {
+        // 卓易通里的设置要对卓易通本身做，先说清楚，免得在涛声的设置里找半天
+        val container = (LocalContext.current.applicationContext as? app.resound.ResoundApp)?.pipelineDiagnostics?.system ==
+            app.resound.scheduling.BackgroundSystem.Type.Container
+        if (container) Text("你在鸿蒙的卓易通里用涛声，下面带“卓易通”的那项要在鸿蒙系统设置里对卓易通做。",
+            style = RsType.caption, color = c.textSecondary, modifier = Modifier.padding(start = 4.dp, end = 4.dp, bottom = 8.dp))
         RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 6.dp)) {
             items.forEachIndexed { i, item ->
                 SetupRow(item, onOpen = { setup.open(item.key); version++ }, onDone = { setup.markDone(item.key); version++ })
@@ -552,6 +621,50 @@ private fun SetupRow(item: SetupItem, onOpen: () -> Unit, onDone: () -> Unit) {
     }
 }
 
+/** 录音占着麦克风时，很多手机的唤醒芯片会被系统暂停；涛声改不了，只说替代办法 */
+@Composable
+private fun WakeWordSection() {
+    Section("语音助手") {
+        RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
+            Text(app.resound.ui.today.WAKE_WORD_TIP, style = RsType.caption, color = Rs.colors.textSecondary)
+        }
+    }
+}
+
+/** 卡 195：打点前后各包含多久（只影响之后的新打点） */
+@Composable
+private fun MarkRangeSection() {
+    val c = Rs.colors
+    val settings = app.resound.AppGraph.markSettings
+    val range by settings.range.collectAsStateWithLifecycle()
+    val options = listOf(30_000L to "30 秒", 60_000L to "1 分钟", 120_000L to "2 分钟", 300_000L to "5 分钟", 600_000L to "10 分钟")
+    @Composable fun Choices(label: String, value: Long, onPick: (Long) -> Unit) {
+        Text(label, style = RsType.subhead, color = c.text)
+        Spacer(Modifier.height(8.dp))
+        androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.forEach { (ms, text) ->
+                val on = ms == value
+                Text(text, style = RsType.subhead.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium),
+                    color = if (on) c.onSelected else c.textSecondary,
+                    modifier = Modifier.clip(androidx.compose.foundation.shape.CircleShape).background(if (on) c.selected else c.fill)
+                        .springClick { onPick(ms) }.padding(horizontal = 14.dp, vertical = 7.dp))
+            }
+        }
+    }
+    Section("打点“记一下”") {
+        RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
+            Text("录音时在通知栏、长按图标或桌面小组件点“记一下”，回放时点“📍记一下”。打点前后这段会整理得更细、附上关键原话，原声也按重点保留。",
+                style = RsType.caption, color = c.textSecondary)
+            Spacer(Modifier.height(14.dp))
+            Choices("往前包含", range.beforeMillis) { settings.setRange(it, range.afterMillis) }
+            Spacer(Modifier.height(14.dp))
+            Choices("往后包含", range.afterMillis) { settings.setRange(range.beforeMillis, it) }
+            Spacer(Modifier.height(10.dp))
+            Text("只影响之后新打的点。", style = RsType.caption, color = c.textTertiary)
+        }
+    }
+}
+
 /** 可选权限：打开“使用情况访问”后，麦克风被占时能猜出前台是哪个应用。不计入上面的后台设置完成数。 */
 @Composable
 private fun MicHolderSection() {
@@ -578,8 +691,18 @@ private fun ExportRow(stats: CaptureStatsRepository) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
+    // 问题记录已包含这里的运行诊断，只留一个按钮，免得用户分不清两份记录。
+    if (app.resound.AppGraph.isProblemReportsReady) {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            app.resound.ui.settings.ExportProblemPill()
+            Spacer(Modifier.height(8.dp))
+            Text("遇到闪退或功能不对，导出发给开发。只含运行情况和出错位置，不含原话、待办和密钥。",
+                style = RsType.caption, color = c.textTertiary, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        }
+        return
+    }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Pill(if (busy) "正在导出…" else "导出诊断记录", filled = false) {
+        Pill(if (busy) "正在导出…" else "导出问题记录", filled = false) {
             if (busy) return@Pill
             busy = true
             scope.launch {

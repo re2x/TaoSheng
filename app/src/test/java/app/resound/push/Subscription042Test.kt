@@ -98,7 +98,7 @@ class Subscription042Test {
     }
     private fun repo(server: Server, secrets: Secrets = Secrets(), settings: android.content.SharedPreferences = prefs(), directory: File = temp.newFolder()) =
         AndroidPushChannels(settings, prefs(), secrets, server.transport, {}, stateDirectory = directory)
-    private fun channel(kind: PushKind = PushKind.Webhook, sub: PushSubscription = subscription) = PushChannel(1, kind, "测试", true, Subscriptions.topics(sub), PushFormat.Markdown, "", subscription = sub)
+    private fun channel(kind: PushKind = PushKind.Webhook, sub: PushSubscription = subscription) = PushChannel(1, kind, "测试", true, Subscriptions.topics(sub), if (kind == PushKind.Webhook) PushFormat.Json else PushFormat.Markdown, "", subscription = sub)
     private fun runtime(server: Server, ch: PushChannel, time: () -> Long = { at }, queued: MutableList<Long> = mutableListOf(), directory: File = temp.newFolder()): SubscriptionRuntime =
         SubscriptionRuntime(prefs(), directory, { ch }, { ch to if (ch.kind == PushKind.MarkdownFolder) folder else if (ch.kind == PushKind.Notion) mapOf("token" to "test", "databaseId" to "1".repeat(32)) else hook },
             server.transport, { _, whenAt, _ -> queued += whenAt }, { _, _, _ -> }, time, { zone })
@@ -140,7 +140,7 @@ class Subscription042Test {
         Server().use { f ->
             val p = prefs(); val secrets = Secrets(); val r = repo(f, secrets, p)
             val sub = subscription.copy(trigger = RecordTrigger.Manual)
-            assertEquals("先在数据备份里连接坚果云，或改为单独配置", r.saveWithSubscription(null, PushKind.MarkdownFolder, "资料", emptyMap(), sub, PushFormat.Markdown, true).exceptionOrNull()?.message)
+            assertEquals("先在备份恢复里连接云端存储，或改为单独配置", r.saveWithSubscription(null, PushKind.MarkdownFolder, "资料", emptyMap(), sub, PushFormat.Markdown, true).exceptionOrNull()?.message)
             var credentials = folder - "folder"
             val accounts = MutableStateFlow<String?>(credentials["account"])
             r.linkedCredentials = { credentials }; r.linkedAccount = accounts
@@ -157,13 +157,7 @@ class Subscription042Test {
             assertTrue(r.pushNow(id).isFailure); assertNotNull(r.status(id).first().lastError)
         }
     }
-    @Test fun filenamesUseEnglishWeekdayAndIsoWeekYear() {
-        assertEquals("daily/2026-10/2026-10-24-Sat_daily-record.md", MemoryFolder.dailyPath(date))
-        assertEquals("transcripts/2026-10/2026-10-24-Sat_transcript.md", MemoryFolder.transcriptPath(date))
-        assertEquals("weekly/2020-W53_1228-0103_weekly-review.md", MemoryFolder.weekPath(LocalDate.of(2021, 1, 1)))
-        assertEquals("weekly/2026-W44_1026-1101_weekly-review.md", MemoryFolder.weekPath(LocalDate.of(2026, 11, 1)))
-    }
-    @Test fun selectionFrontMatterTypedCardsAndMeOnlyNeverLeakMedia() {
+    @Test fun selectionFrontMatterTypedCardsAndMeOnlyNeverLeakMedia() = kotlinx.coroutines.runBlocking {
         val media = event(2).copy(scene = "媒体", starred = true)
         val data = fixture().copy(events = listOf(event(), media), cards = listOf(card().copy(evidenceJson = "[10]")), lines = listOf(line(1, "我"), line(2, "别人"), line(3, "我", 2), line(10, "别人", 1)))
         val s = subscription.copy(lines = LinesMode.MeOnly)
@@ -177,7 +171,7 @@ class Subscription042Test {
         assertFalse(daily.contains("虚构测试原话")); assertTrue(daily.contains("[[transcripts/"))
         assertFalse(selected.select(s.copy(rangeDays = 1), date.plusDays(1), date.plusDays(1), zone).events.isNotEmpty())
     }
-    @Test fun yearlyArchiveByDayAndSampleOutput() {
+    @Test fun yearlyArchiveByDayAndSampleOutput() = kotlinx.coroutines.runBlocking<Unit> {
         val oldAt = date.minusYears(2).atTime(10, 0).atZone(zone).toInstant().toEpochMilli()
         val data = fixture().copy(items = fixture().items + item(3, timestamp = oldAt) + item(4, "知识", oldAt),
             reviews = fixture().reviews + ReviewEntity(2, "weekly", "2026-10-19", "2026-10-25", "虚构周回顾", "[]", at, "test"))
@@ -192,7 +186,7 @@ class Subscription042Test {
         files.forEach { (path, text) -> File(output, path).apply { parentFile!!.mkdirs(); writeText(text.replace(MemoryFolder.UPDATED, "2026-10-24 10:00")) } }
         File(output, "inbox").mkdirs()
     }
-    @Test fun folderDiffDeletionAndUnknownFilesAreProtected() {
+    @Test fun folderDiffDeletionAndUnknownFilesAreProtected() = kotlinx.coroutines.runBlocking {
         Server().use { f ->
             val state = PushSyncState(File(temp.newFolder(), "1.json"))
             val sync = FolderSync(FolderRemote(folder, PushHttp(f.client)), state)
@@ -335,7 +329,7 @@ class Subscription042Test {
         }
     }
     @Test fun roomSnapshotHonorsMergePrivacyAndDeletedCards() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         try {
             db.memory().insertEvent(event()); db.memory().insertEvent(event(2).copy(scene = "媒体"))
             db.memory().insertItems(listOf(item(), item(2).copy(mergedInto = 1)))

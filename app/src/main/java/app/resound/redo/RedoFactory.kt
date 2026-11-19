@@ -1,10 +1,14 @@
 package app.resound.redo
 
+import app.resound.context.SituationLookup
+import app.resound.update.UpdateDiagnostics
+
 import android.content.Context
 import app.resound.appName
 import app.resound.data.*
 import app.resound.digest.*
 import app.resound.transcribe.*
+import app.resound.digest.snapshot
 import app.resound.skills.*
 import app.resound.usage.UsagePurpose
 import kotlinx.coroutines.*
@@ -17,7 +21,7 @@ internal fun createRedoEngine(context: Context, db: CaptureDatabase, chooser: An
     hotwords: () -> List<String>, template: () -> String, mergeTemplate: () -> String,
     identify: suspend (List<Long>) -> Unit,
     network: (TranscribeSource) -> Boolean,
-    situation: app.resound.context.SituationLookup? = null,
+    situation: SituationLookup? = null,
 ): RedoEngine {
     val provider = ConfiguredAsrProvider(context, settings, hotwords)
     val files = SkillFiles(context)
@@ -29,7 +33,8 @@ internal fun createRedoEngine(context: Context, db: CaptureDatabase, chooser: An
         val key = settings.credential(source)
         var sent = 0L; var error: AsrError? = null; var outcome = "Failed"; var log: String? = null
         try {
-            val result = provider.recognize(source, AsrAudio(File(segment.path), File(segment.path).extension, segment.endAt - segment.startAt, separateSpeakers = segment.separateSpeakers ?: true), key) {
+            val result = provider.recognize(source, AsrAudio(File(segment.path), File(segment.path).extension, segment.endAt - segment.startAt, separateSpeakers = segment
+                .separateSpeakers ?: true), key) {
                 if (source != TranscribeSource.Local) {
                     sent = segment.endAt - segment.startAt
                     db.transcribe().reserveAudio(LocalDate.now().toString(), sent, segment.id)
@@ -50,15 +55,19 @@ internal fun createRedoEngine(context: Context, db: CaptureDatabase, chooser: An
             require(presetId == null || digestSettings.presets.any { it.id == presetId }) { "重做所选服务商已删除，请重新选择" }
             digestSettings.skillCredentials(presetId)
         }
-        val contextPrompt = SituationPrompt(digestSettings.includeSituation.value, situation)
+        val recordings = db.transcribe().playbackMillis(lines.map { it.segmentId }.distinct())
+        val contextPrompt = SituationPrompt(digestSettings.includeSituation.value, situation,
+            recordings.associate { it.id to it.playbackMillis }, db.marks()::overlapping, recordings)
         val (text, indexed) = contextPrompt.transcript(lines, unseparated = db.transcribe().unseparated(lines.map { it.segmentId }.distinct()).toSet())
-        val input = DigestPrompt.withTodoContext(DigestPrompt.withHotwords(text, hotwords()), db.memory().unfinishedForDigest(), db.memory().ignoredForDigest(System.currentTimeMillis() - 60L * 86_400_000))
-        val reply = digestSettings.failover.request("重新整理", db.memory(), app.resound.usage.UsagePurpose.Digest, digestSettings.digestRequest(llm))(preset, key, contextPrompt.system(DigestPrompt.system(template(), LocalDate.now(), context.appName)), input)
+        val input = DigestPrompt.withTodoContext(DigestPrompt.withHotwords(text, hotwords()), db.memory().unfinishedForDigest(), db.memory().ignoredForDigest(System
+            .currentTimeMillis() - 60L * 86_400_000))
+        val reply = digestSettings.failover.request("重新整理", db.memory(), UsagePurpose.Digest, digestSettings.digestRequest(llm))(preset, key, contextPrompt.system(
+            DigestPrompt.system(template(), LocalDate.now(), context.appName)), input)
         withContext(NonCancellable) { db.memory().addUsage(LocalDate.now().toString(), reply.promptTokens, reply.completionTokens, UsagePurpose.Digest) }
         val (events, items) = DigestPrompt.parse(reply.content, indexed, diagnostics = reply.diagnostics)
         val at = System.currentTimeMillis()
-        RedoDigest(events.map { e -> MemoryEventEntity(startAt = e.startAt, endAt = e.endAt,
-            scene = if (db.envSound().media(e.startAt, e.endAt)) "媒体" else e.scene, title = e.title, summary = e.summary,
+        RedoDigest(events.mapIndexed { eventIndex, e -> MemoryEventEntity(startAt = e.startAt, endAt = e.endAt,
+            scene = if (items.none { it.eventIndex == eventIndex && it.category in setOf("待办", "约定") } && db.envSound().media(e.startAt, e.endAt)) "媒体" else e.scene, title = e.title, summary = e.summary,
             pointsJson = JSONArray(e.points).toString(), peopleJson = JSONArray(e.people).toString(), place = e.place,
             emotion = e.emotion, intensity = e.intensity, important = e.important, createdAt = at, model = reply.actualModel ?: preset.model) to e.lineIds },
             { ids -> items.map { i -> MemoryItemEntity(eventId = ids[i.eventIndex], category = i.category, kind = i.kind, content = i.content,
@@ -70,7 +79,8 @@ internal fun createRedoEngine(context: Context, db: CaptureDatabase, chooser: An
         }
         val indexed = lines.sortedBy { it.startAt }
         val contextPrompt = SituationPrompt(digestSettings.includeSituation.value, situation)
-        val reply = digestSettings.failover.request("合并事件", db.memory(), app.resound.usage.UsagePurpose.Digest, digestSettings.digestRequest(llm))(preset, key, contextPrompt.system(MergePrompt.system(mergeTemplate(), LocalDate.now(), context.appName)), contextPrompt.merge(events))
+        val reply = digestSettings.failover.request("合并事件", db.memory(), UsagePurpose.Digest, digestSettings.digestRequest(llm))(preset, key, contextPrompt.system(
+            MergePrompt.system(mergeTemplate(), LocalDate.now(), context.appName)), contextPrompt.merge(events))
         withContext(NonCancellable) { db.memory().addUsage(LocalDate.now().toString(), reply.promptTokens, reply.completionTokens, UsagePurpose.Digest) }
         val (event, items) = MergePrompt.parse(reply.content, indexed)
         val at = System.currentTimeMillis()
@@ -86,20 +96,37 @@ internal fun createRedoEngine(context: Context, db: CaptureDatabase, chooser: An
         oldCards.groupBy { it.skillId to it.date }.flatMap { (group, _) ->
             val skill = files.skills.value.find { it.id == group.first } ?: error("相关技能已删除，无法重新生成")
             val date = LocalDate.ofEpochDay(group.second)
-            val start = date.atStartOfDay(SKILL_ZONE).toInstant().toEpochMilli()
-            val end = date.plusDays(1).atStartOfDay(SKILL_ZONE).toInstant().toEpochMilli()
-            val bounded = SkillInputs.boundedLines(lines.filter { it.startAt < end && it.endAt > start }, skill.scope.speakers)
+            val start = date.atStartOfDay(SKILL_ZONE(date)).toInstant().toEpochMilli()
+            val end = date.plusDays(1).atStartOfDay(SKILL_ZONE(date)).toInstant().toEpochMilli()
+            val raw = lines.filter { it.startAt < end && it.endAt > start }
+            val gateLines = SkillInputs.gateLines(raw.map { it.snapshot() }, skill.scope.speakers, events.map { it.first.snapshot() })
+            val gateFailure = SkillGateRules.failure(skill.gate, gateLines)
+            if (gateFailure != null) {
+                UpdateDiagnostics.record(context, "重做技能 ${skill.id}：$gateFailure")
+                return@flatMap emptyList()
+            }
+            val bounded = SkillInputs.boundedLines(raw, skill.scope.speakers)
             val indexed = bounded.mapIndexed { i, l -> "L${i + 1}" to l }.toMap()
             val input = SkillInput(buildString {
                 appendLine("归属日期：$date；以下是这段时间重新整理后的事件：")
-                events.filter { it.first.startAt < end && it.first.endAt > start }.forEach { (e, _) -> appendLine("${SkillInputs.time(e.startAt)}～${SkillInputs.time(e.endAt)} ${e.title}：${e.summary}") }
+                events.filter { it.first.startAt < end && it.first.endAt > start }.forEach { (e, _) -> appendLine("${SkillInputs.time(e.startAt)}～${SkillInputs.time(e
+                    .endAt)} ${e.title}：${e.summary}") }
                 appendLine("原话：")
                 indexed.forEach { (id, l) -> appendLine("[$id] ${SkillInputs.time(l.startAt)} ${SkillInputs.speaker(l)}：${l.text}") }
             }, indexed)
             val (preset, key) = digestSettings.skillCredentials(skill.presetId)
-            val reply = digestSettings.failover.request("重做技能", db.memory(), app.resound.usage.UsagePurpose.Skill, llm::chatJson)(preset, key, SkillPrompt.system(skill, files.prompt(skill.id), date), SkillInputs.user(input, hotwords()))
+            val reply = digestSettings.failover.request("重做技能", db.memory(), UsagePurpose.Skill, llm::chatJson)(preset, key, SkillPrompt.system(skill, files.prompt(skill
+                .id), date), SkillInputs.user(input, hotwords()))
             withContext(NonCancellable) { db.memory().addUsage(LocalDate.now().toString(), reply.promptTokens, reply.completionTokens, UsagePurpose.Skill) }
-            SkillOutput.parse(reply.content, skill, date, input, System.currentTimeMillis(), false).rows.take(skill.maxCardsPerDay)
+            val rows = SkillOutput.parse(reply.content, skill, date, input, System.currentTimeMillis(), false).rows
+            val timed = rows.map { row ->
+                if (skill.gate == null) row else app.resound.skills.core.SkillCardTiming.complete(
+                    row.snapshot(), raw.map { it.snapshot() }, events.map { it.first.snapshot() }).android()
+            }
+            val accepted = timed.filter { SkillGateRules.cardFailure(skill.gate, gateLines, it.at, it.endAt) == null }
+            if (accepted.size < rows.size) UpdateDiagnostics.record(context,
+                "重做技能 ${skill.id}：门槛复核丢弃 ${rows.size - accepted.size} 张")
+            accepted.take(skill.maxCardsPerDay)
         }
     }, pauseMillis = { digestSettings.pauseMinutes.value * 60_000L })
 }

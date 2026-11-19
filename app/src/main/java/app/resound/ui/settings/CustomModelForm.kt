@@ -1,5 +1,6 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -35,7 +36,7 @@ internal fun SettingsInput(value:String,onChange:(String)->Unit,hint:String,modi
         textStyle=RsType.body.copy(color=c.text),cursorBrush=SolidColor(c.accent),
         visualTransformation=if(secret)PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions=KeyboardOptions(keyboardType=if(secret)KeyboardType.Password else KeyboardType.Uri,imeAction=ImeAction.Done),modifier=modifier,
-        decorationBox={inner->Box(Modifier.clip(RoundedCornerShape(14.dp)).background(c.background).padding(horizontal=14.dp,vertical=12.dp)) {
+        decorationBox={inner->Box(Modifier.clip(RoundedCornerShape(14.dp)).background(c.fill).padding(horizontal=14.dp,vertical=12.dp)) {
             if(value.isEmpty())Text(hint,style=RsType.body,color=c.textTertiary)
             inner()
         }})
@@ -101,7 +102,7 @@ internal fun CustomModelForm(initialEndpoint:String,initialModel:String,hasKey:B
             }
         }
         if(modes!=null && full) {
-            val prompt by modes.prompt.collectAsState()
+            val prompt by modes.prompt.collectAsStateWithLifecycle()
             Spacer(Modifier.height(16.dp))
             Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {

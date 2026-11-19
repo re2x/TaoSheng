@@ -1,0 +1,118 @@
+package app.resound.capture
+
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.MainActivity
+import app.resound.OutputTime
+import app.resound.R
+import app.resound.onboarding.LocalOnboarding
+import app.resound.topic.TopicActionReceiver
+import app.resound.topic.TopicNotifications
+import app.resound.ui.items.QuickTodoActivity
+
+import app.resound.appName
+import app.resound.AppGraph
+import app.resound.quick.QuickPrefsRules
+import android.Manifest
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+
+object CaptureNotifications {
+    const val ONGOING = 1
+    const val INTERRUPTED = 2
+    const val SILENT_MIC = 3
+    fun channels(context: Context) {
+        context.getSystemService(NotificationManager::class.java).createNotificationChannels(listOf(
+            // 低调但不隐瞒：常驻通知用最低优先级，不占状态栏图标、排在通知栏末尾；系统麦克风绿点仍在
+            NotificationChannel("listening", "后台运行", NotificationManager.IMPORTANCE_MIN),
+            NotificationChannel("interrupted", "需要恢复", NotificationManager.IMPORTANCE_HIGH)))
+    }
+    fun permitted(context: Context) = NotificationManagerCompat.from(context).areNotificationsEnabled() &&
+        (Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+    private fun pauseMinutes() = if (AppGraph.isQuickPrefsReady) AppGraph.quickPrefs.lastPauseMinutes.value else QuickPrefsRules.DEFAULT_PAUSE
+    private fun action(context: Context, action: String): PendingIntent = PendingIntent.getForegroundService(context, action.hashCode(),
+        Intent(context, CaptureService::class.java).setAction(action).putExtra("route", "notification").putExtra("minutes", pauseMinutes()), PendingIntent
+            .FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    /** 快速加待办：浮在当前界面上直接语音输入，不进入涛声主界面 */
+    private fun addTodo(context: Context): PendingIntent = PendingIntent.getActivity(context, 24,
+        Intent(context, QuickTodoActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    private fun openApp(context: Context): PendingIntent = PendingIntent.getActivity(context, 25,
+        Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    private fun openTopic(context: Context, id: Long): PendingIntent = PendingIntent.getActivity(context, 26,
+        Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            .putExtra("open", "topic").putExtra("topicId", id), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    fun ongoing(context: Context, paused: Boolean): Notification {
+        val prefs = context.getSharedPreferences("capture", Context.MODE_PRIVATE)
+        val quietName = prefs.getString("quietName", null).takeIf { paused }
+        val until = prefs.getLong("pausedUntil", 0)
+        // 通知是界面：今天只写时刻，第二天写“明天”，更远才写日期（文件、推送正文才一律写全）
+        val at = java.time.Instant.ofEpochMilli(until).atZone(java.time.ZoneId.systemDefault())
+        val hm = at.format(java.time.format.DateTimeFormatter.ofPattern("H:mm"))
+        val clock = CaptureNotificationPolicy.clock(java.time.temporal.ChronoUnit.DAYS.between(java.time.LocalDate.now(), at.toLocalDate()), hm, OutputTime().moment(until))
+        val topic = if (AppGraph.isTopicsReady) AppGraph.topics.current.value else null
+        val topicLine = topic?.let { TopicNotifications.line(it) }
+        val notice = CaptureNotificationPolicy.night(CaptureNotificationPolicy.ongoing(context.appName, paused, quietName, clock, topicLine, pauseMinutes()), app.resound.AppGraph.isNightReady && app.resound.AppGraph.night.live.value.state in setOf(app.resound.night.NightState.Active, app.resound.night.NightState.Provisional))
+        val kind = if (AppGraph.isQuickPrefsReady) AppGraph.quickPrefs.lastTopicKind.value else QuickPrefsRules.defaultTopic
+        return NotificationCompat.Builder(context, "listening")
+        .setSmallIcon(R.drawable.ic_notify).setContentTitle(notice.title)
+        .setContentText(if (!paused && AppGraph.isInputsReady)
+            AppGraph.inputs.status.value.note?.takeIf { it.startsWith(app.resound.audio.MicYield.PLAYBACK) } ?: notice.text
+            else notice.text)
+        .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(false)
+        // 正在听时点通知打开涛声；暂停时照旧点一下就恢复（文案就是这么写的）
+        // 专题进行中点通知直接打开这场专题（大按钮记一下/暂停/结束）：系统常把常驻通知收起，按钮要长按才看得到
+        .setPriority(NotificationCompat.PRIORITY_MIN).setContentIntent(when (notice.target) {
+            CaptureNoticeTarget.Resume -> action(context, CaptureService.RESUME)
+            CaptureNoticeTarget.Topic -> openTopic(context, requireNotNull(topic).id)
+            CaptureNoticeTarget.App -> openApp(context)
+        })
+        .apply {
+            val remember = !paused && (context.applicationContext as? app.resound.ResoundApp)?.playbackSession?.canRemember == true
+            if (remember) addAction(0, "记下外放", action(context, CaptureService.REMEMBER_PLAYBACK))
+            if (topic != null) TopicNotifications.actions(this, context, topic)
+            else {
+                // 顺序：加待办、开专题、暂停（暂停中为“恢复”）
+                if (!remember) addAction(0, CaptureNotificationPolicy.ADD_TODO, addTodo(context))
+                if (!paused) addAction(0, "记一下", TopicActionReceiver.intent(context, "mark"))
+                else addAction(0, CaptureNotificationPolicy.START_TOPIC, TopicActionReceiver.intent(context, "start"))
+                addAction(0, notice.toggle, action(context, if (paused) CaptureService.RESUME else CaptureService.PAUSE))
+            }
+        }
+        .build()
+    }
+    fun interrupted(context: Context) {
+        // 与现有中断判定共用入口，即使没有通知权限也保留事实。
+        LocalOnboarding.captureInterrupted(context)
+        channels(context)
+        if (!permitted(context)) return
+        try { NotificationManagerCompat.from(context).notify(INTERRUPTED, NotificationCompat.Builder(context, "interrupted")
+            .setSmallIcon(R.drawable.ic_notify).setContentTitle(CaptureNotificationPolicy.interrupted(context.appName))
+            .setContentText(CaptureNotificationPolicy.INTERRUPTED_DETAIL).setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(action(context, CaptureService.RESUME)).setAutoCancel(true).build()) } catch (caught: SecurityException) {
+                FailureNotes.record("capture/CaptureNotificationsAndroid.kt:95", caught)
+                }
+    }
+    /** 卡 112：麦克风一直收不到声音，重开也没用 */
+    fun silentMic(context: Context) {
+        channels(context)
+        if (!permitted(context)) return
+        try { NotificationManagerCompat.from(context).notify(SILENT_MIC, NotificationCompat.Builder(context, "interrupted")
+            .setSmallIcon(R.drawable.ic_notify).setContentTitle(CaptureNotificationPolicy.SILENT)
+            .setContentText(CaptureNotificationPolicy.SILENT_DETAIL).setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(openApp(context)).setAutoCancel(true).build()) } catch (caught: SecurityException) {
+                FailureNotes.record("capture/CaptureNotificationsAndroid.kt:104", caught)
+                }
+    }
+    fun cancelSilentMic(context: Context) = NotificationManagerCompat.from(context).cancel(SILENT_MIC)
+}

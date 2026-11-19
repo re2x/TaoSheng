@@ -1,5 +1,6 @@
 package app.resound.usage
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -27,6 +28,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
 import java.io.File
+import kotlinx.datetime.toKotlinLocalDate
 import java.time.LocalDate
 import java.time.ZoneId
 
@@ -46,7 +48,7 @@ class Usage043Test {
         override suspend fun send(title: String, body: String, deepLink: String?, topic: PushTopic?) = Unit
     }
     @Before fun setup() {
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         root = File(context.cacheDir, "usage043").apply { deleteRecursively(); mkdirs() }
         (BackupSettings.prefs + BackupSettings.stores.keys + setOf("ask-suggestions", "digest-state"))
@@ -59,7 +61,7 @@ class Usage043Test {
     @Test fun migrates14To15PreservingTotalsAsOther() = runBlocking {
         val name = "usage-migration.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/14.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/14.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, 0, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { i ->
@@ -75,12 +77,12 @@ class Usage043Test {
         }
         val migrated = CaptureDatabase.open(context, name)
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             val rows = migrated.memory().usageByPurpose("2026-10-23", "2026-10-24").first()
             assertEquals(listOf("Other", "Other"), rows.map { it.purpose })
             assertEquals(32L, rows.sumOf { it.promptTokens }); assertEquals(8L, rows.sumOf { it.completionTokens })
             assertEquals(3, rows.sumOf { it.calls })
-            migrated.openHelper.writableDatabase.query("SELECT name FROM sqlite_master WHERE name='llm_usage'").use { assertFalse(it.moveToFirst()) }
+            migrated.testSql.query("SELECT name FROM sqlite_master WHERE name='llm_usage'").use { assertFalse(it.moveToFirst()) }
         } finally { migrated.close(); context.deleteDatabase(name) }
     }
 
@@ -89,7 +91,7 @@ class Usage043Test {
         memory.addUsage(day.minusDays(1).toString(), 999, 999)
         memory.addUsage(day.plusDays(2).toString(), 999, 999)
         val updates = Channel<List<LlmUsageRow>>(Channel.UNLIMITED)
-        val watcher = launch { repo.llm(day, day.plusDays(1)).collect { updates.send(it) } }
+        val watcher = launch { repo.llm(day.toKotlinLocalDate(), day.plusDays(1).toKotlinLocalDate()).collect { updates.send(it) } }
         try {
             assertTrue(withTimeout(5000) { updates.receive() }.isEmpty())
             memory.addUsage(day.toString(), 10, 2, UsagePurpose.Digest)
@@ -98,9 +100,9 @@ class Usage043Test {
             memory.addUsage(day.toString(), 20, 3, UsagePurpose.Digest)
             memory.addUsage(day.toString(), 7, 1, UsagePurpose.Ask)
             memory.addUsage(day.plusDays(1).toString(), 4, 2)
-            val rows = repo.llm(day, day.plusDays(1)).first()
+            val rows = repo.llm(day.toKotlinLocalDate(), day.plusDays(1).toKotlinLocalDate()).first()
             assertEquals(3, rows.size)
-            assertEquals(LlmUsageRow(day, UsagePurpose.Digest, 30, 5, 2), rows.single { it.purpose == UsagePurpose.Digest })
+            assertEquals(LlmUsageRow(day.toKotlinLocalDate(), UsagePurpose.Digest, 30, 5, 2), rows.single { it.purpose == UsagePurpose.Digest })
             assertEquals(UsagePurpose.Other, rows.last().purpose)
             val total = memory.observeUsage().first().single { it.day == day.toString() }
             assertEquals(37L, total.promptTokens); assertEquals(6L, total.completionTokens); assertEquals(3, total.calls)
@@ -116,11 +118,11 @@ class Usage043Test {
             }
         }, { "test" }, { _, _ -> }, today = { day.toString() })
         assertTrue(runner(false).test(audio, "test").isSuccess)
-        assertTrue(repo().asr(day, day).first().isEmpty())
+        assertTrue(repo().asr(day.toKotlinLocalDate(), day.toKotlinLocalDate()).first().isEmpty())
         assertTrue(runner(true).test(audio, "test").isSuccess)
         db.transcribe().reserveAudio(day.plusDays(1).toString(), 4000, null)
         db.transcribe().reserveAudio(day.minusDays(1).toString(), 999, null)
-        assertEquals(listOf(AsrUsageRow(day, 3000), AsrUsageRow(day.plusDays(1), 4000)), repo().asr(day, day.plusDays(1)).first())
+        assertEquals(listOf(AsrUsageRow(day.toKotlinLocalDate(), 3000), AsrUsageRow(day.plusDays(1).toKotlinLocalDate(), 4000)), repo().asr(day.toKotlinLocalDate(), day.plusDays(1).toKotlinLocalDate()).first())
     }
 
     @Test fun pricesPersistValidateAndRoundTripThroughBackupIncludingNull() {
@@ -151,7 +153,7 @@ class Usage043Test {
         val preset = LlmPreset("test", "test", "https://example.invalid", "test")
         val review = RoomReviewRepository(db.review(), db.memory(), context.getSharedPreferences("review", 0), scope,
             { preset to "test" }, { _, _, _, _ -> LlmReply("""{"brief":"今天讨论项目","sections":[]}""", 20, 2) }, { "测试" }, "回响", notifier, {},
-            now = { at + 23 * 3600000 }, zone = { zone })
+            now = { at + 23 * 3600000 }, zone = { zone }, io = kotlinx.coroutines.Dispatchers.IO)
         review.run(day, false)
         val files = SkillFiles(File(root, "skills")) {
             File("src/main/assets/skills").listFiles()!!.map { dir ->
@@ -162,10 +164,16 @@ class Usage043Test {
         val skills = LocalSkillRepository(files, db.skills(), db.memory(), scope, { preset to "test" }, { _, _, _, _ ->
             if (draft) LlmReply("""{"ask":"希望几点提醒？","options":["早上","晚上"]}""", 40, 4)
             else LlmReply("""{"cards":[],"nothing_reason":"没有会议"}""", 30, 3)
-        }, { emptyList() }, notifier, { _, _ -> }, { at + 23 * 3600000 })
-        skills.trial("meeting", day, null)
+        }, { emptyList() }, notifier, { _, _ -> }, { at + 23 * 3600000 }, io = kotlinx.coroutines.Dispatchers.IO)
+        // 卡 146：会议需两人、20 句、跨度至少 10 分钟；让真实门槛通过后验证用量。
+        db.transcribe().insertLines((2L..21L).map { id ->
+            val start = at + 1000 + (id - 1) * 40_000
+            TranscriptLineEntity(id, 1, start, start + 1000, "讨论项目方案 $id",
+                (id % 2).toString(), if (id % 2 == 0L) "我" else "同事", 1)
+        })
+        assertTrue(skills.trial("meeting", day, null) is SkillRunResult.Nothing)
         draft = true; skills.draft(listOf(DraftTurn(true, "帮我记录会议")))
-        val rows = repo().llm(day.minusDays(1), LocalDate.now().plusDays(1).coerceAtLeast(day)).first().associateBy { it.purpose }
+        val rows = repo().llm(day.minusDays(1).toKotlinLocalDate(), LocalDate.now().plusDays(1).coerceAtLeast(day).toKotlinLocalDate()).first().associateBy { it.purpose }
         assertEquals(setOf(UsagePurpose.Digest, UsagePurpose.Review, UsagePurpose.Skill, UsagePurpose.Draft), rows.keys)
         listOf(UsagePurpose.Digest, UsagePurpose.Review, UsagePurpose.Skill, UsagePurpose.Draft).forEachIndexed { index, purpose ->
             assertEquals((index + 1) * 10L, rows.getValue(purpose).promptTokens)
@@ -186,10 +194,10 @@ class Usage043Test {
                 .body(body.toResponseBody("application/json".toMediaType())).build()
         }.build())
         AppGraph.prompts = app.resound.prompts.LocalPromptTemplates(context)
-        val ask = createAskRepository(context, db, client, AndroidDigestSettings(context, client), scope, readKey = { "test" })
-        withTimeout(5000) { repo().llm(today, today).first { it.sumOf { r -> r.calls } == 1 } }
+        val ask = createAskRepository(context, db, client, AndroidDigestSettings(context, client), scope, app.resound.platform.SystemNow, readKey = { "test" })
+        withTimeout(5000) { repo().llm(today.toKotlinLocalDate(), today.toKotlinLocalDate()).first { it.sumOf { r -> r.calls } == 1 } }
         ask.ask("今天做了什么？")
-        val row = withTimeout(5000) { repo().llm(today, today).first { it.sumOf { r -> r.calls } == 2 } }.single()
+        val row = withTimeout(5000) { repo().llm(today.toKotlinLocalDate(), today.toKotlinLocalDate()).first { it.sumOf { r -> r.calls } == 2 } }.single()
         assertEquals(UsagePurpose.Ask, row.purpose); assertEquals(30L, row.promptTokens); assertEquals(3L, row.completionTokens)
     }
 }

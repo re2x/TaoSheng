@@ -1,5 +1,6 @@
 package app.resound.ask
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -32,7 +33,7 @@ class AskPersistenceTest {
         for (version in listOf(1, 5)) {
             val name = "ask-migration-$version.db"
             context.deleteDatabase(name)
-            val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/$version.json").readText()).getJSONObject("database")
+            val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/$version.json").readText()).getJSONObject("database")
             context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
                 val entities = schema.getJSONArray("entities")
                 for (i in 0 until entities.length()) {
@@ -51,11 +52,11 @@ class AskPersistenceTest {
                 }
                 old.version = version
             }
-            fun open() = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+            fun open() = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
                 .addMigrations(*CaptureDatabase.MIGRATIONS).build()
             var db = open()
             try {
-                assertEquals(CaptureDatabase.VERSION, db.openHelper.writableDatabase.version) // Room 验证全部表、列、索引和外键。
+                assertEquals(CaptureDatabase.VERSION, db.testSql.version) // Room 验证全部表、列、索引和外键。
                 assertEquals(if (version == 1) "Pending" else "Done", db.transcribe().segment(1).status)
                 if (version == 5) {
                     assertEquals("旧原话", db.voiceprint().line(7)!!.text)
@@ -75,7 +76,7 @@ class AskPersistenceTest {
     }
 
     @Test fun stopPersistsOnlyFinalPartialAndRestartAndNewConversationStayIsolated() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val key = AtomicBoolean(true); val calls = AtomicInteger()
         val started = CompletableDeferred<Unit>()
@@ -89,7 +90,7 @@ class AskPersistenceTest {
                     else { delta("半句[^1]"); started.complete(Unit); awaitCancellation() }
                 }, JSONArray().put(JSONObject()), { _,_,sources -> sources += source; JSONObject().put("ref",1) },
                     { p,c -> db.memory().addUsage("2026-10-23",p,c) })
-            }, system={"提示词"}, recommended=recommended)
+            }, system={"提示词"}, recommended=recommended, now=System::currentTimeMillis)
         }
         try {
             val repo = repository(); repo.ask("问一问")
@@ -118,14 +119,14 @@ class AskPersistenceTest {
     }
 
     @Test fun historySearchPagingSelectionRenameAndDelete() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val prefs = context.getSharedPreferences("history-test", Context.MODE_PRIVATE)
         var selection: Long? = null
         fun repository() = RoomAskRepository(db.ask(), scope, { false },
             engine = { error("No network expected") }, system = { "" },
             recommended = AskSuggestions(prefs, { false }, { "" }, { emptyList() }),
-            readSelected = { selection }, saveSelected = { selection = it })
+            now = System::currentTimeMillis, readSelected = { selection }, saveSelected = { selection = it })
         try {
             val ids = (1..32).map { n ->
                 val id = db.ask().insertConversation(AskConversationEntity(createdAt = n.toLong(), title = "标题$n"))

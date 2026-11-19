@@ -37,7 +37,7 @@ class ReviewPreparation053Test {
             "[]", "[]", null, null, null, false, false, at, "test"))
     }
     @Test fun timeoutWhileWaitingForPipelineStillGeneratesDailyReview() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val lock = Mutex(locked = true)
         val logs = mutableListOf<String>()
@@ -49,7 +49,7 @@ class ReviewPreparation053Test {
                     generated = true
                     LlmReply("""{"brief":"新回顾","sections":[{"title":"一句话","lines":[{"text":"讨论方案","eventId":1}]},{"title":"发生了什么","lines":[{"text":"讨论方案","eventId":1}]}]}""", 1, 1)
                 }, { "测试" }, "涛声", notifier, {}, now = { at }, zone = { zone },
-                beforeReview = { ReviewPreparation.prepare(30, logs::add) { lock.withLock { error("不应拿到锁") } } })
+                beforeReview = { ReviewPreparation.prepare(30, logs::add) { lock.withLock { error("不应拿到锁") } } }, io = kotlinx.coroutines.Dispatchers.IO)
             assertFalse(repo.run(day, scheduled = false))
             assertTrue(generated); assertNotNull(repo.daily(day).first())
             assertEquals(listOf("超时，使用已有内容"), logs)
@@ -58,7 +58,7 @@ class ReviewPreparation053Test {
     }
 
     @Test fun successfulPreparationSuppliesFreshEventsToWeeklyReview() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val root = File(context.cacheDir, "weekly053")
         root.deleteRecursively()
@@ -72,7 +72,7 @@ class ReviewPreparation053Test {
                     assertTrue(prepared); assertTrue(input.contains("讨论方案")); generated = true
                     LlmReply("""{"cards":[{"title":"本周回顾","summary":"讨论方案","values":{"one_line":"推进方案"}}]}""", 1, 1)
                 }, { emptyList() }, notifier, { _, _ -> }, now = { at + 1000 },
-                beforeWeeklyReview = { ReviewPreparation.prepare(record = {}) { seed(db); prepared = true; "完成" } })
+                beforeWeeklyReview = { ReviewPreparation.prepare(record = {}) { seed(db); prepared = true; "完成" } }, io = kotlinx.coroutines.Dispatchers.IO)
             assertTrue(repo.runNow("weekly", day) is SkillRunResult.Cards)
             assertTrue(generated)
         } finally { scope.coroutineContext[Job]!!.cancelAndJoin(); db.close(); root.deleteRecursively() }

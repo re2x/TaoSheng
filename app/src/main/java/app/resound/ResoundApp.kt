@@ -1,7 +1,13 @@
 package app.resound
 
+import app.resound.data.open
+
+import app.resound.data.retryFailed
+
 import app.resound.push.attachSubscriptions
 import app.resound.push.attachFootprint
+import app.resound.push.attachDayThread
+import app.resound.push.attachScreenTime
 
 import android.app.Application
 import app.resound.capture.*
@@ -16,25 +22,31 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 
 class ResoundApp : Application() {
+    private lateinit var watchdogPreferences: android.content.SharedPreferences.OnSharedPreferenceChangeListener
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    internal val pipelineDiagnostics by lazy { app.resound.transcribe.PipelineDiagnostics(this) }
+    internal val pipelineScheduler by lazy { app.resound.transcribe.PipelineScheduler(this) }
     val inputs by lazy { app.resound.audio.AndroidInputDevices(this) }
-    internal lateinit var cardDevices: app.resound.devices.ManagedDevices
+    internal lateinit var cardDevices: app.resound.devices.android.DeviceInputs
     val database by lazy { CaptureDatabase.open(this) }
     val store by lazy { CaptureStore(this, database.capture()) }
     val quietSchedule by lazy { AndroidQuietSchedule(store.prefs, arm = { AndroidQuietSchedule.arm(this, it) }, changed = CaptureService::recheck) }
-    val segmentFiles by lazy { SegmentFiles(this, database.capture(), scope) }
+    val playbackSession = PlaybackSession()
+    val segmentFiles by lazy { SegmentFiles(this, database.capture(), scope, AppGraph.playbackSettings,
+        { from, until -> app.resound.screentime.PlaybackQueries(database.screenTime()).duringCapture(from, until, System.currentTimeMillis()) }, { at -> playbackSession.remembers(at) }) }
     internal lateinit var topics: app.resound.topic.TopicFeature
     private lateinit var transcribeScheduler: TranscribeScheduler
     fun rescheduleDigest(changed: Boolean = false) {
         if (changed) transcribeScheduler.timingChanged() else transcribeScheduler.scheduleDigest()
     }
-    fun enqueueTimedDigest(target: Long, expires: Long) = transcribeScheduler.enqueueTimed(target, expires)
-    fun timedDigestValid(target: Long): Boolean {
-        val timing = AppGraph.digestTiming
-        val local = java.time.Instant.ofEpochMilli(target).atZone(java.time.ZoneId.systemDefault())
-        return timing.mode.value == DigestMode.TimePoints && local.hour * 60 + local.minute in timing.timePoints.value
+    fun recoverTimedDigest() = transcribeScheduler.recoverTimed()
+    suspend fun resumeWaitingTranscriptionBatch(action: String?) {
+        when (action) {
+            android.content.Intent.ACTION_SCREEN_ON -> pipelineScheduler.trigger("亮屏")
+            android.content.Intent.ACTION_POWER_CONNECTED -> pipelineScheduler.trigger("接电")
+        }
+        transcribeScheduler.resumeWaitingBatch(action)
     }
-    suspend fun resumeWaitingTranscriptionBatch(action: String?) = transcribeScheduler.resumeWaitingBatch(action)
     fun runTranscriptionNow() = transcribeScheduler.runNow()
     lateinit var controller: AndroidCaptureController
         private set
@@ -46,12 +58,31 @@ class ResoundApp : Application() {
         private set
     override fun onCreate() {
         super.onCreate()
+        AppGraph.platform = app.resound.platform.PlatformServices(
+            now = app.resound.platform.SystemNow,
+            zone = app.resound.platform.SystemZone,
+            logger = app.resound.platform.AndroidLogger,
+            keyValueStore = app.resound.platform.PrefsKeyValueStore(getSharedPreferences("platform", MODE_PRIVATE)),
+            files = app.resound.platform.LocalFileStore(app.resound.platform.AndroidDispatchers),
+            dispatchers = app.resound.platform.AndroidDispatchers,
+        )
+        AppGraph.markSettings = app.resound.marks.AndroidMarkSettings(getSharedPreferences("marks", MODE_PRIVATE))
+        AppGraph.marks = app.resound.marks.MarkRepository(database, AppGraph.platform.now::now,
+            { AppGraph.markSettings.range.value }, { topicId, markId -> AppGraph.topics.unmark(topicId, markId) })
         val crashes = app.resound.diagnostics.CrashRecords(this)
         crashes.installHandler()
         appDisplayName = appName
         if (getProcessName().endsWith(":local_asr")) return
         registerActivityLifecycleCallbacks(BackgroundTranscribeDiagnostics)
         app.resound.backup.BackupRestore.applyPending(this)
+        scope.launch {
+            val tables = getString(R.string.capture_diagnostic_tables).split(',').toTypedArray()
+            database.invalidationTracker.addObserver(object : androidx.room.InvalidationTracker.Observer(tables) {
+                override fun onInvalidated(tables: Set<String>) = app.resound.data.captureQueryStats.invalidated(tables)
+            })
+        }
+        app.resound.platform.AndroidZoneHistory(getSharedPreferences("zone-history", MODE_PRIVATE)).attach(this)
+        AppGraph.quickPrefs = app.resound.quick.AndroidQuickPrefs(this)
         val asrSpeed = AndroidAsrSpeedSettings(getSharedPreferences("asr-speed", MODE_PRIVATE), scope).apply { topicTraining = database.topics()::trainingAt }
         AppGraph.asrSpeed = asrSpeed
         // 课堂模式开关、到点结束、总开关变化：刷新常驻通知和下拉磁贴
@@ -74,7 +105,10 @@ class ResoundApp : Application() {
             getSharedPreferences("usage", MODE_PRIVATE))
         AppGraph.prompts = app.resound.prompts.LocalPromptTemplates(this)
         AppGraph.inputs = inputs
-        AppGraph.playbackSkip = AndroidPlaybackSkipSettings(this)
+        AppGraph.playbackSettings = playbackSettings(getSharedPreferences("transcribe", MODE_PRIVATE))
+        AppGraph.playbackSkip = LegacyPlaybackControls(AppGraph.playbackSettings, scope)
+        scope.launch { app.resound.notice.RemoteNotices.get(this@ResoundApp).watchPlayback(database.transcribe()) }
+        AppGraph.playback = PlaybackMonitor(this, scope)
         CaptureNotifications.channels(this)
         controller = AndroidCaptureController(this, store)
         AppGraph.capture = controller
@@ -93,7 +127,7 @@ class ResoundApp : Application() {
         hotwords.topicWords = { if (AppGraph.isTopicsReady) app.resound.topic.TopicPolicy.words(AppGraph.topics.current.value?.takeIf { app.resound.topic.TopicPolicy.activeAt(it, System.currentTimeMillis()) }?.name) else emptyList() }
         AppGraph.importer = app.resound.importer.AndroidAudioImporter(this, scope, fingerprints = database.folderImports())
         // 声纹标注后只重跑声纹；lateinit 的仓库在 run() 被调用时早已赋值
-        val voiceprintRerun = app.resound.voiceprint.VoiceprintRerun(scope, { voiceprintRepository.run() }, scheduler::runNow)
+        val voiceprintRerun = app.resound.voiceprint.VoiceprintRerun(scope, { voiceprintRepository.run() }, scheduler::runNow, AppGraph.platform.dispatchers)
         val pcmReader = AsrAudioReader(cacheDir)
         val sharedPcm = SharedPcmFiles(cacheDir, pcmReader::decodeForExport)
         voiceprintRepository = LocalVoiceprintRepository(database, scope, { file -> sharedPcm.read(file, pcmReader::readPcm) },
@@ -101,10 +135,67 @@ class ResoundApp : Application() {
             sampleAudioStore = SampleAudioStore(SampleAudioStore.directory(this)))
         AppGraph.voiceprint = voiceprintRepository
         val envSound = app.resound.envsound.LocalEnvSoundRepository.create(this, database, scope,
-            voiceprintRepository::recognizesMeBeforeTranscribe, scheduler::runNow, sharedPcm)
+            voiceprintRepository::recognizesMeBeforeTranscribe, scheduler::runNow, sharedPcm, AppGraph.platform.zone, AppGraph.platform.now::now, AppGraph.platform.dispatchers.io)
         AppGraph.envSound = envSound
+        AppGraph.night = app.resound.night.AndroidNight.create(this, database, scope, envSound)
         AppGraph.location = app.resound.location.LocationRepository.create(this, database, scope)
-        AppGraph.situation = app.resound.context.LocalSituationLookup.create(database, AppGraph.location)
+        AppGraph.situation = app.resound.context.LocalSituationLookup.create(database, AppGraph.location, scope, AppGraph.platform.zone, AppGraph.platform.dispatchers.io)
+        val playbackPrefs = getSharedPreferences("playback-title", MODE_PRIVATE)
+        val playbackTitleSettings = app.resound.screentime.PlaybackTitleSettings(
+            readBoolean = { key, def -> playbackPrefs.getBoolean(key, def) },
+            saveBoolean = { key, value -> playbackPrefs.edit().putBoolean(key, value).commit() },
+            readLong = { key, def -> playbackPrefs.getLong(key, def) },
+            saveLong = { key, value -> playbackPrefs.edit().putLong(key, value).commit() },
+            now = AppGraph.platform.now::now)
+        AppGraph.playbackTitleSettings = playbackTitleSettings
+        AppGraph.playbackSink = app.resound.screentime.PlaybackRecorder(
+            database.screenTime(), playbackTitleSettings) { pkgs -> app.resound.screentime.appLabels(this, pkgs) }
+        AppGraph.playbackQueries = app.resound.screentime.PlaybackQueries(database.screenTime())
+        AppGraph.playbackSentences = PlaybackSentences { id ->
+            val lines = database.transcribe().linesForRedo(id)
+            if (lines.isEmpty()) emptyList() else {
+                val rows = AppGraph.situation.devicePlayback(lines.minOf { it.startAt }, lines.maxOf { it.endAt })
+                app.resound.digest.core.playbackLabels(database.transcribe().playbackMillis(listOf(id)),
+                    lines.map { it.snapshot() }, rows).values.toList()
+            }
+        }
+
+        val screenPrefs = getSharedPreferences("screen-time", MODE_PRIVATE)
+        val screenTimeSettings = app.resound.screentime.ScreenTimeSettings(
+            readBoolean = { key, def -> screenPrefs.getBoolean(key, def) },
+            persist = { bools, longs, strs ->
+                val editor = screenPrefs.edit()
+                bools.forEach { (key, value) -> editor.putBoolean(key, value) }
+                longs.forEach { (key, value) -> editor.putLong(key, value) }
+                strs.forEach { (key, value) -> editor.putString(key, value) }
+                editor.commit()
+            },
+            readLong = { key, def -> screenPrefs.getLong(key, def) },
+            now = AppGraph.platform.now::now,
+            readString = { key, def -> screenPrefs.getString(key, def) ?: def })
+        AppGraph.screenTimeSettings = screenTimeSettings
+        val screenTimeSource = app.resound.screentime.AndroidScreenEventSource(this)
+        AppGraph.screenTimePuller = app.resound.screentime.ScreenTimePuller(screenTimeSettings,
+            screenTimeSource, database.screenTime(),
+            now = AppGraph.platform.now::now, denied = { it is SecurityException },
+            diagnostic = { android.util.Log.i("screentime", it) })
+        val launcherPkgs = packageManager.queryIntentActivities(
+            android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_HOME),
+            android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+            .filter { it.priority >= 0 }
+            .mapNotNull { it.activityInfo?.packageName }.toSet() + "com.android.systemui"
+        AppGraph.screenTimeReader = app.resound.screentime.ScreenTimeQueries(database.screenTime(),
+            AppGraph.screenTimePuller, screenTimeSettings, permitted = screenTimeSource::permitted,
+            playbackPermitted = { androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this).contains(packageName) },
+            excluded = launcherPkgs, now = AppGraph.platform.now::now,
+            playbackQueries = AppGraph.playbackQueries!!,
+            titlesAllowed = { playbackTitleSettings.enabled.value })
+        scope.launch {
+            screenTimeSettings.enabled.collect { on ->
+                app.resound.screentime.ScreenTimePullWorker.schedule(this@ResoundApp, on)
+                if (on) launch { AppGraph.screenTimePuller.pull() }
+            }
+        }
         val originalAudio = LocalOriginalAudio(database.transcribe(), getSharedPreferences("transcribe", MODE_PRIVATE), scope,
             guard = { block -> voiceprintRepository.withAudioCleanup(block) },
             playback = PlaybackCaptureHold(scope, CaptureService::playbackHold))
@@ -115,7 +206,15 @@ class ResoundApp : Application() {
             recentFiles = { from, until, block -> segmentFiles.withRecentDeletion(from, until, block) },
             voiceprintGuard = { block -> voiceprintRepository.withPrivacyDeletion(block) },
             removeFeatures = voiceprintRepository::removeFeatures,
-            scheduleCleanup = { app.resound.privacy.PrivacyCleanupWorker.enqueue(this) })
+            onErased = {
+                if (AppGraph.isPushReady) (AppGraph.push as? app.resound.push.AndroidPushChannels)?.privacyChanges?.trySend(Unit)
+                app.resound.push.DayThreadPushScheduler.afterDeletion(this)
+            },
+            scheduleCleanup = { app.resound.privacy.PrivacyCleanupWorker.enqueue(this) },
+            archiveFiles = { from,until,block ->
+                check(::cardDevices.isInitialized) { "设备归档尚未就绪，请稍后重试" }
+                cardDevices.withArchivePrivacyDeletion(from,until,block)
+            })
         app.resound.privacy.PrivacyCleanupWorker.start(this)
         AppGraph.privacy = privacyActions
         AppGraph.segmentDeleter = privacyActions
@@ -123,7 +222,7 @@ class ResoundApp : Application() {
             ExportSpeeds(getSharedPreferences("export-speeds", MODE_PRIVATE))) { PipelineTimes.record(this, it) }
         AppGraph.audioExporter.cleanup()
         AppGraph.exportJobs = AndroidExportJobs(this, AppGraph.audioExporter, scope)
-        val transcripts = RoomTranscriptRepository(this, database.transcribe(), settings, scheduler, scope)
+        val transcripts = RoomTranscriptRepository(this, database.transcribe(), settings, scheduler, scope, AppGraph.platform.zone, AppGraph.platform.now, AppGraph.platform.dispatchers.io)
         val asrChooser = app.resound.redo.AndroidAsrChooser(this, settings, scope) { AppGraph.usage.price.value.asrPerHour }
         val sourceNetwork: (TranscribeSource) -> Boolean = { source ->
             if (source == TranscribeSource.Local) true else {
@@ -134,7 +233,7 @@ class ResoundApp : Application() {
             }
         }
         transcribeRunner = TranscribeRunner(database.transcribe(), ConfiguredAsrProvider(this, settings, hotwords::merged),
-            settings::credential, transcripts::updateState, deferAudioCleanup = true,
+            settings::credential, transcripts::updateState,
             sourceReady = settings::ready, sourceKey = settings::credential, sourceNetwork = sourceNetwork, recordSpeed = asrChooser::record,
             recordTiming = { PipelineTimes.recordSegment(this, it) },
             defaultSource = { settings.source.value }, separateSpeakers = asrSpeed::effectiveSeparateSpeakers, topicTraining = database.topics()::trainingAt,
@@ -156,6 +255,7 @@ class ResoundApp : Application() {
                     (!settings.wifiOnly.value || network.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED))
                 }
             })
+        transcribeRunner.localResume = app.resound.transcribe.local.LocalResumeQueue(this)
         settings.testKey = { key ->
             val file = File.createTempFile("asr-test-", ".ogg", cacheDir)
             try {
@@ -174,10 +274,12 @@ class ResoundApp : Application() {
         val (things, thingExtraction) = app.resound.things.createThings(this, database, scope, digestSettings) { AppGraph.prompts.text("things") }
         AppGraph.things = things
         val skillScheduler = app.resound.skills.SkillScheduler(this)
-        digestRunner = DigestRunner(this, database.memory(), llm, digestSettings, { AppGraph.prompts.text("digest") }, situation = AppGraph.situation, thingExtraction = thingExtraction, networkAllowed = {
+        digestRunner = DigestRunner(this, database.memory(), llm, digestSettings, { AppGraph.prompts.text("digest") }, situation = AppGraph.situation, marks = database.marks()::overlapping, thingExtraction = thingExtraction, networkAllowed = {
             val connectivity = getSystemService(ConnectivityManager::class.java)
             connectivity.getNetworkCapabilities(connectivity.activeNetwork)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-        }, unseparated = database.transcribe()::unseparated, isMedia = database.envSound()::media, voiceprintReady = voiceprintRepository::isReady, hotwords = hotwords::merged, afterDigest = { manual -> app.resound.importer.ImportTodoMerge.all(database); skillScheduler.afterDigest(manual) })
+        }, unseparated = database.transcribe()::unseparated, playbackMillis = database.transcribe()::playbackMillis,
+            isMedia = database.envSound()::media, voiceprintReady = voiceprintRepository::isReady, hotwords = hotwords::merged,
+            afterDigest = { manual -> app.resound.importer.ImportTodoMerge.all(database); skillScheduler.afterDigest(manual) })
         AppGraph.importKinds = app.resound.importer.AndroidImportKinds.create(this, database,
             AppGraph.importer as app.resound.importer.AndroidAudioImporter, scope, digestSettings, llm,
             app.resound.importer.ImportSpeakers(database, pcmReader::readPcm, { CampPlusEmbedding(this) }),
@@ -196,8 +298,9 @@ class ResoundApp : Application() {
         AppGraph.memory = RoomMemoryRepository(database.memory(), digestRunner, {
             // 手动：等着重试的转写段一并马上重试，再整理
             scope.launch { database.transcribe().retryFailed(); scheduler.runDigestNow() }
-        }, scope, appointmentSettings, { app.resound.search.EmbeddingScheduler.enqueue(this, continuation = true) })
-        AppGraph.rhythm = RoomRhythmStats(database)
+        }, scope, appointmentSettings, { app.resound.search.EmbeddingScheduler.enqueue(this, continuation = true) }, AppGraph.platform.zone, AppGraph.platform.now, AppGraph.platform.dispatchers.io,
+            onEventDeleted = { app.resound.push.DayThreadPushScheduler.afterDeletion(this) })
+        AppGraph.rhythm = RoomRhythmStats(database, java.time.ZoneId.of(AppGraph.platform.zone.zoneId()))
         AppGraph.digestSettings = digestSettings
         AppGraph.llmProviders = digestSettings.providers
         AppGraph.llmBalance = app.resound.usage.LlmBalanceChecker(getSharedPreferences("llm-balance", MODE_PRIVATE), digestSettings.providers, { b, line ->
@@ -230,7 +333,7 @@ class ResoundApp : Application() {
             app.resound.push.ChannelNotifier(app.resound.push.LocalNotifier(this), pushChannels), { reviewScheduler.schedule(it, changed = true) },
             dailyMemory = pushChannels::dispatchDailyMemory,
             beforeReview = { app.resound.review.ReviewPreparation.run(this) },
-            work = androidx.work.WorkManager.getInstance(this), hasBackup = { digestSettings.canUseWithoutKey(it) || digestSettings.failover.hasBackup(it) })
+            work = androidx.work.WorkManager.getInstance(this), hasBackup = { digestSettings.canUseWithoutKey(it) || digestSettings.failover.hasBackup(it) }, now = AppGraph.platform.now::now, zone = { java.time.ZoneId.of(AppGraph.platform.zone.zoneId()) }, io = AppGraph.platform.dispatchers.io)
         val skillFiles = app.resound.skills.SkillFiles(this)
         digestSettings.providers.beforeDelete = { id -> skillFiles.resetProviders(setOf(id)) }
         skillFiles.resetProviders(skillFiles.skills.value.mapNotNull { it.presetId }.toSet() - digestSettings.presets.map { it.id }.toSet())
@@ -241,25 +344,32 @@ class ResoundApp : Application() {
             generation = app.resound.skills.SkillGeneration(androidx.work.WorkManager.getInstance(this), database.skills(), scope),
             beforeWeeklyReview = { app.resound.review.ReviewPreparation.run(this) },
             hasBackup = { digestSettings.canUseWithoutKey(it) || digestSettings.failover.hasBackup(it) },
-            draftRequest = digestSettings.failover.request("技能生成", database.memory(), app.resound.usage.UsagePurpose.Draft, llm::chatJson))
+            draftRequest = digestSettings.failover.request("技能生成", database.memory(), app.resound.usage.UsagePurpose.Draft, llm::chatJson), now = app.resound.AppGraph.platform.now::now, io = app.resound.AppGraph.platform.dispatchers.io)
         AppGraph.skills = skillRepository
-        scope.launch { skillRepository.reschedule() }
+        scope.launch { skillRepository.reschedule(); skillScheduler.backfill207() }
         AppGraph.review = reviews
-        AppGraph.diary = app.resound.diary.LocalDiaryRepository(this, AppGraph.memory, reviews, database.memory(),
+        AppGraph.diary = app.resound.diary.LocalDiaryRepository(this, AppGraph.memory, reviews, database.memory(), AppGraph.platform.zone, AppGraph.platform.dispatchers.io,
             cards = { date -> skillRepository.cards(date).first() })
         val dailyMemory = app.resound.push.DailyMemorySource(this, AppGraph.memory, reviews, database.memory(), database.review(), database.skills())
         pushChannels.memoryDocument = dailyMemory::load
         reviewScheduler.schedule(reviews.state.value.dailyAtMinutes)
-        AppGraph.ask = app.resound.ask.createAskRepository(this, database, llm, digestSettings, scope)
+        AppGraph.ask = app.resound.ask.createAskRepository(this, database, llm, digestSettings, scope, AppGraph.platform.now)
         AppGraph.transcripts = transcripts
         AppGraph.transcribeSettings = settings
-        AppGraph.stats = RoomCaptureStatsRepository(this, database.capture(), transcripts::diagnostics)
+        AppGraph.stats = RoomCaptureStatsRepository(this, database.capture(), AppGraph.platform.zone, transcripts::diagnostics)
         AppGraph.setup = AndroidSetupGuide(this)
         segmentFiles // 启动串行编码队列，重试完整暂存片段。
         scheduler.schedule()
+        registerActivityLifecycleCallbacks(app.resound.digest.DigestForegroundRecovery(this))
         app.resound.search.EmbeddingScheduler.start(this)
         val backupRepository = app.resound.backup.AndroidBackupRepository(this, database, diary = AppGraph.diary)
         AppGraph.backup = backupRepository
+        AppGraph.health = app.resound.health.AndroidHealthCheck(this, controller, quietSchedule, settings, transcripts,
+            digestSettings, digestSettings.providers, AppGraph.llmBalance, backupRepository, database.capture(), scope)
+        app.resound.quick.attachQuickActionsAndroid(this, scope, controller, AppGraph.topics, AppGraph.quickPrefs,
+            app.resound.quick.DefaultQuickActionsPolicy())
+        // 桌面小组件只在状态变化时更新（没有小组件时不做事）
+        app.resound.widget.CaptureWidget.attach(this, scope, controller, AppGraph.topics)
         AppGraph.onboarding = app.resound.onboarding.LocalOnboarding(
             getSharedPreferences("onboarding", MODE_PRIVATE), getSharedPreferences("backup", MODE_PRIVATE),
             database.transcribe().onboardingFirstTranscript(),
@@ -276,17 +386,23 @@ class ResoundApp : Application() {
         AppGraph.deviceScanError = cardDevices.lastError
         inputs.attachCards(cardDevices, AppGraph.deviceCards, scope)
         app.resound.devices.DeviceCardsWork.schedule(this)
+        app.resound.notice.NoticeWork.schedule(this)
         app.resound.update.UpdateWork.schedule(this, updater.autoCheck.value, updater.previewChannel.value)
+        pipelineScheduler
         registerActivityLifecycleCallbacks(app.resound.update.UpdateForegroundChecks(updater, scope))
         pushChannels.attachSubscriptions(this, database, backupRepository, scope)
         pushChannels.attachFootprint(this, scope)
+        pushChannels.attachScreenTime(this, scope)
+        pushChannels.attachDayThread(this, database, scope)
         app.resound.recordings.attachRecordingArchive(this, database, pushChannels, scope)
         scope.launch { transcribeRunner.recoverOnStartup(); transcribeRunner.withIdleAudio { voiceprintRepository.cleanupAudio() } }
         val folderImports = app.resound.importer.AndroidFolderImports(this, database, scope,
             AppGraph.importer as app.resound.importer.AndroidAudioImporter)
         AppGraph.folderImports = folderImports
+        AppGraph.folderRecordings = folderImports.recordings
+        folderImports.recordings.start()
         registerActivityLifecycleCallbacks(app.resound.importer.FolderImportForeground(folderImports))
         ImportAudioCleanupWork.schedule(this)
-        if (store.prefs.getBoolean("enabled", false)) CaptureWatchdog.schedule(this)
+        watchdogPreferences = CaptureWatchdog.observe(this, store.prefs)
     }
 }

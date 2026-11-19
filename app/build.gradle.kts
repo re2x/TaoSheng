@@ -4,7 +4,6 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
-    id("com.google.devtools.ksp")
 }
 
 android {
@@ -14,11 +13,18 @@ android {
 
     defaultConfig {
         applicationId = if (project.hasProperty("localAsrValidation")) "app.resound.validation" else "app.resound"
+        // 使用 Room 导出的当前实体名，失效统计随 schema 自动更新。
+        val schema = rootProject.file("shared/schemas/app.resound.data.CaptureDatabase").listFiles()!!
+            .filter { it.extension == "json" }.maxBy { it.nameWithoutExtension.toInt() }
+        val tables = Regex(""""tableName"\s*:\s*"([a-zA-Z0-9_]+)"""")
+            .findAll(providers.fileContents(layout.projectDirectory.file(schema.relativeTo(projectDir).path)).asText.get())
+            .map { it.groupValues[1] }.distinct().joinToString(",")
+        resValue("string", "capture_diagnostic_tables", tables)
         minSdk = 29
         targetSdk = 35
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 65
-        versionName = "0.2.22" + (providers.gradleProperty("previewNumber").orNull?.let {
+        versionCode = 86
+        versionName = "0.5.2" + (providers.gradleProperty("previewNumber").orNull?.let {
             require(it.matches(Regex("[1-9][0-9]*"))) { "previewNumber 必须为正整数" }
             "-preview.$it"
         } ?: "")
@@ -33,7 +39,7 @@ android {
     // 正式签名只放在负责人电脑上（~/.config/taosheng/signing.properties），不进仓库；
     // 其他人编译时找不到就退回调试签名，不影响编译
     val releaseSigning = File(System.getProperty("user.home"), ".config/taosheng/signing.properties")
-        .takeIf { it.isFile }
+        .takeIf { !providers.gradleProperty("skipSigningSecrets").map(String::toBoolean).getOrElse(false) && it.isFile }
         ?.let { file -> Properties().apply { file.inputStream().use { load(it) } } }
     signingConfigs {
         if (releaseSigning != null) create("release") {
@@ -73,6 +79,9 @@ kotlin {
 }
 
 dependencies {
+    implementation(project(":devices"))
+    implementation(project(":shared"))
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0") // 与共用模块一致；技能门槛 JSON 可供 iOS 复用
     implementation("org.ahocorasick:ahocorasick:0.4.0") // 随包 TinyPinyin 的依赖
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     implementation("androidx.documentfile:documentfile:1.0.0")
@@ -80,17 +89,17 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     implementation("org.apache.commons:commons-compress:1.27.1")
     implementation("commons-io:commons-io:2.16.1")
+    implementation("androidx.sqlite:sqlite-framework:2.6.2")
     implementation("androidx.room:room-runtime:2.8.4")
     implementation("androidx.room:room-ktx:2.8.4")
-    ksp("androidx.room:room-compiler:2.8.4")
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
+    implementation("androidx.work:work-runtime-ktx:2.10.5")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.25.1")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.16")
     testImplementation("org.json:json:20240303")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
-    testImplementation("androidx.work:work-testing:2.10.0")
+    testImplementation("androidx.work:work-testing:2.10.5")
     val composeBom = platform("androidx.compose:compose-bom:2026.06.01")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
@@ -111,4 +120,29 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
 }
 
-ksp { arg("room.schemaLocation", "$projectDir/schemas") }
+
+// 卡 151：Ktor 引擎兼容现有 OkHttp；禁止传递依赖升级范围外网络组件。
+configurations.configureEach {
+    resolutionStrategy.force(
+        "com.squareup.okhttp3:okhttp:4.12.0",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0",
+        "org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.9.0",
+        "org.jetbrains.kotlin:kotlin-stdlib:2.2.20",
+    )
+}
+
+// 更新日志：打包时把仓库根目录的 CHANGELOG.md 复制进安装包，App 里“版本更新 → 更新日志”和更新后的“这次更新了什么”都读它，只维护一份
+abstract class ChangelogAsset : DefaultTask() {
+    @get:InputFile abstract val source: RegularFileProperty
+    @get:OutputDirectory abstract val output: DirectoryProperty
+    @TaskAction fun copy() {
+        val dir = output.get().asFile.apply { deleteRecursively(); mkdirs() }
+        source.get().asFile.copyTo(File(dir, "CHANGELOG.md"), overwrite = true)
+    }
+}
+val changelogAsset = tasks.register<ChangelogAsset>("changelogAsset") {
+    source.set(rootProject.layout.projectDirectory.file("CHANGELOG.md"))
+}
+androidComponents {
+    onVariants { variant -> variant.sources.assets?.addGeneratedSourceDirectory(changelogAsset, ChangelogAsset::output) }
+}

@@ -1,5 +1,6 @@
 package app.resound.ui.transcript
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.height
@@ -23,7 +24,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -147,7 +147,7 @@ fun ExportSheet(segmentIds: List<Long>, suggestedTitle: String, onDismiss: () ->
         }
         OptionRow("跳过媒体片段", "电视、视频的声音不导出", skipMedia) { skipMedia = it; p.edit().putBoolean("exportSkipMedia", it).apply() }
         val jobs = if (app.resound.AppGraph.isExportJobsReady) app.resound.AppGraph.exportJobs else null
-        val job = jobId?.let { id -> jobs?.jobs?.collectAsState()?.value?.firstOrNull { it.id == id } }
+        val job = jobId?.let { id -> jobs?.jobs?.collectAsStateWithLifecycle()?.value?.firstOrNull { it.id == id } }
         val running = progress
         val ready = done
         when {
@@ -282,7 +282,7 @@ private fun PreviewPlayer(file: java.io.File, srt: java.io.File?) {
     // 当前句：开始时间不晚于播放位置的最后一句（停顿时仍停在上一句，像歌词一样）
     val playingIdx = cues.indexOfLast { it.start <= shown }.coerceAtLeast(0)
     val center = playingIdx
-    Column(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp)).background(c.background)
+    Column(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(20.dp)).background(c.fill)
         .padding(horizontal = 14.dp, vertical = 10.dp)) {
         if (cues.isNotEmpty()) {
             // 歌词式三行：上一句 / 当前这句（加粗）/ 下一句
@@ -401,7 +401,7 @@ private fun ShareChooser(files: List<java.io.File>, name: String, onShared: () -
         options.forEach { kind ->
             val on = kind == last
             Row(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
-                .background(if (on) c.accentSoft else c.background).springClick {
+                .background(if (on) c.accentSoft else c.fill).springClick {
                     p.edit().putString("shareKind", kind.name).apply()
                     scope.launch {
                         val target = when (kind) {
@@ -499,7 +499,7 @@ internal fun JobBody(job: app.resound.transcribe.ExportJob, onClose: () -> Unit)
 @Composable
 fun ExportJobSheet(jobId: String, onDismiss: () -> Unit) {
     if (!app.resound.AppGraph.isExportJobsReady) { onDismiss(); return }
-    val job = app.resound.AppGraph.exportJobs.jobs.collectAsState().value.firstOrNull { it.id == jobId }
+    val job = app.resound.AppGraph.exportJobs.jobs.collectAsStateWithLifecycle().value.firstOrNull { it.id == jobId }
     if (job == null) { LaunchedEffect(Unit) { LinePlayer.notice = "这次导出的文件已清理"; onDismiss() }; return }
     fun close() { ExportUi.seen(jobId); onDismiss() }
     RsSheet(job.title, null, onDismiss = { close() }) {
@@ -531,7 +531,7 @@ object ExportUi {
 fun ExportCapsule(bottomPadding: androidx.compose.ui.unit.Dp) {
     if (!app.resound.AppGraph.isExportJobsReady) return
     val c = Rs.colors
-    val jobs by app.resound.AppGraph.exportJobs.jobs.collectAsState()
+    val jobs by app.resound.AppGraph.exportJobs.jobs.collectAsStateWithLifecycle()
     val job = jobs.lastOrNull { it.state is app.resound.transcribe.ExportJobState.Running } ?: jobs.lastOrNull { it.state is app.resound.transcribe.ExportJobState.Done }
     val text = when (val st = job?.state) {
         is app.resound.transcribe.ExportJobState.Running -> "正在导出 ${(st.fraction * 100).toInt()}% ›"
@@ -543,7 +543,7 @@ fun ExportCapsule(bottomPadding: androidx.compose.ui.unit.Dp) {
         exit = androidx.compose.animation.fadeOut()) {
         androidx.compose.foundation.layout.Box(Modifier.fillMaxWidth().padding(bottom = bottomPadding), contentAlignment = Alignment.BottomCenter) {
             Row(Modifier.clip(CircleShape).background(c.accent), verticalAlignment = Alignment.CenterVertically) {
-                Text(text ?: "", style = RsType.subhead.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold), color = androidx.compose.ui.graphics.Color.White,
+                Text(text ?: "", style = RsType.subhead.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold), color = c.onAccent,
                     modifier = Modifier.springClick { job?.let { ExportUi.openJob = it.id } }
                         .padding(start = 18.dp, end = if (job?.state is app.resound.transcribe.ExportJobState.Done) 6.dp else 18.dp, top = 10.dp, bottom = 10.dp))
                 // 完成后右边一个小 ×：这次导出不要了就点掉

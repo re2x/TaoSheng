@@ -1,5 +1,6 @@
 package app.resound.ui.transcript
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -17,7 +18,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -51,7 +51,7 @@ import java.time.LocalDate
 internal fun RecordingPackRow() {
     if (!AppGraph.isRecordingPackerReady) return
     val packer = AppGraph.recordingPacker
-    val current by packer.current.collectAsState()
+    val current by packer.current.collectAsStateWithLifecycle()
     var open by remember { mutableStateOf(false) }
     val st = current?.second
     SettingLine("录音包", when (st) {
@@ -66,8 +66,8 @@ internal fun RecordingPackRow() {
 private fun RecordingPackSheet(packer: RecordingPacker, onDismiss: () -> Unit) {
     val c = Rs.colors
     val context = LocalContext.current
-    val days by packer.availableDays.collectAsState()
-    val current by packer.current.collectAsState()
+    val days by packer.availableDays.collectAsStateWithLifecycle()
+    val current by packer.current.collectAsStateWithLifecycle()
     var started by remember { mutableStateOf<String?>(null) }
     val today = LocalDate.now()
     val oldest = days.minOrNull() ?: today
@@ -148,7 +148,7 @@ private fun RecordingPackSheet(packer: RecordingPacker, onDismiss: () -> Unit) {
                 estimate?.let { e ->
                     Text("${e.days} 天 · ${e.segments} 段 · ${formatBytes(e.bytes)} · 共 ${formatDuration(e.audioMs, seconds = false)}",
                         style = RsType.subhead, color = c.textSecondary,
-                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.background).padding(14.dp))
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.fill).padding(14.dp))
                 }
                 Text("每段按“日期 时刻 事件标题”命名，如 2026-10-30 09.15 项目周会.ogg", style = RsType.caption, color = c.textTertiary)
                 ActionButton("开始打包", ActionKind.Primary, enabled = pick != null && (estimate?.segments ?: 0) > 0) {
@@ -162,8 +162,8 @@ private fun RecordingPackSheet(packer: RecordingPacker, onDismiss: () -> Unit) {
 @Composable
 private fun DayChip(label: String, on: Boolean, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (on) c.accent else c.background, spring(stiffness = Spring.StiffnessMediumLow), label = "packDay")
-    Text(label, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) Color.White else c.textSecondary,
+    val bg by animateColorAsState(if (on) c.selected else c.fill, spring(stiffness = Spring.StiffnessMediumLow), label = "packDay")
+    Text(label, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) c.onSelected else c.textSecondary,
         modifier = Modifier.clip(CircleShape).background(bg).springClick(onClick).padding(horizontal = 14.dp, vertical = 8.dp))
 }
 
@@ -191,7 +191,7 @@ internal fun RangeEnd(label: String, day: LocalDate, time: java.time.LocalTime, 
 @Composable
 private fun PickBox(text: String, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
-    Box(modifier.clip(RoundedCornerShape(12.dp)).background(c.background).springClick(onClick).padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+    Box(modifier.clip(RoundedCornerShape(12.dp)).background(c.fill).springClick(onClick).padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
         Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum"), color = c.text)
     }
 }

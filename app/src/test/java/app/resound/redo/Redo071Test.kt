@@ -1,5 +1,6 @@
 package app.resound.redo
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -33,7 +34,7 @@ class Redo071Test {
     @Before fun setup() {
         context = RuntimeEnvironment.getApplication()
         listOf("redo-jobs", "redo-choices", "imports", "transcribe", "digest").forEach { context.getSharedPreferences(it, 0).edit().clear().commit() }
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         root = File(context.cacheDir, "redo071-${System.nanoTime()}").apply { mkdirs() }
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
@@ -191,10 +192,10 @@ class Redo071Test {
     }
     @Test fun queuedJobsAreSerialAndRestartUsesPersistedRequests() = runBlocking {
         seed()
-        val service = AndroidRedoService(context, db, chooser, engine(), scope, { listOf(LlmOption("x", "x", true)) }, { "x" }, enqueue = {})
+        val service = AndroidRedoService(context, db, chooser, engine(), scope, { listOf(LlmOption("x", "x", true)) }, { "x" }, enqueue = {}, now = { 100 })
         val a = service.start(RedoRequest(segmentIds = listOf(1), scope = RedoScope.TranscribeOnly))
         val b = service.start(RedoRequest(segmentIds = listOf(1), scope = RedoScope.TranscribeOnly))
-        val restored = AndroidRedoService(context, db, chooser, engine(), scope, { listOf(LlmOption("x", "x", true)) }, { "x" }, enqueue = {})
+        val restored = AndroidRedoService(context, db, chooser, engine(), scope, { listOf(LlmOption("x", "x", true)) }, { "x" }, enqueue = {}, now = { 100 })
         assertEquals(listOf(a, b), restored.jobs.value.map { it.id })
         restored.drain { }
         assertTrue(restored.jobs.value.all { it.state is RedoJobState.Done })
@@ -231,7 +232,7 @@ class Redo071Test {
     }
     @Test fun migration23PreservesDataAndAddsScopedOverrideAndSnapshot() = runBlocking {
         val name = "redo071-migration.db"; context.deleteDatabase(name)
-        val schema = org.json.JSONObject(File("schemas/app.resound.data.CaptureDatabase/23.json").readText()).getJSONObject("database")
+        val schema = org.json.JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/23.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -246,10 +247,10 @@ class Redo071Test {
             old.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(1,1,2,'mic','old',0,'Done')")
             old.version = 23
         }
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals("old", migrated.transcribe().segment(1).path)
             assertNull(migrated.transcribe().segment(1).asrSource); assertFalse(migrated.transcribe().segment(1).redoPending)
             assertNull(migrated.redoData().snapshotMeta())

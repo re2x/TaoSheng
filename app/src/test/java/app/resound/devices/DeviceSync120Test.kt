@@ -1,11 +1,14 @@
 package app.resound.devices
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
 import app.resound.data.CaptureDatabase
 import app.resound.importer.*
-import app.resound.devices.plugins.sonicloud.*
+import app.resound.devices.driver.MillisRange
+import app.resound.devices.driver.DriverStore
+import app.resound.data.SegmentEntity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import org.junit.*
@@ -53,12 +56,43 @@ class DeviceSync120Test {
     }
     @Before fun setup() {
         val context = RuntimeEnvironment.getApplication()
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         root = File(context.filesDir, "test-device120").apply { deleteRecursively(); mkdirs() }
     }
     @After fun close() { db.close(); root.deleteRecursively() }
     private fun sync(plugin: Fake, ingest: suspend (File, DeviceFile, DeviceSlice, String) -> Unit = { _, _, _, _ -> }) =
         DeviceSync("address", root, db, listOf(plugin), ingest)
+
+    @Test fun selectedFilesLeaveUnselectedHistoryAndItsDurablePendingJobUntouched() = runBlocking {
+        val other = file.copy(id="private-history",name="older.pcm")
+        val pending = DeviceTransfer("older-job","address",other.id,other.name,4,10000,10000,"Pcm16",0,10000,10000)
+        db.deviceSync().save(pending)
+        val downloads = mutableListOf<String>()
+        val base = Fake(file)
+        val plugin = object : FileSourcePlugin by base {
+            override suspend fun list(link: DeviceLink) = listOf(file,other)
+            override fun download(link: DeviceLink,file: DeviceFile,fromOffset: Long) = flow {
+                downloads += file.id;emit(byteArrayOf(1,2,3,4))
+            }
+        }
+        val transfer = DeviceSync("address",root,db,listOf(plugin),{ _,_,_,_ -> })
+        transfer.importSelected(card,link,0,setOf(file.id))
+        assertEquals(listOf(file.id),downloads)
+        assertEquals(pending,db.deviceSync().rows("address").single { it.key==pending.key })
+        assertTrue(db.deviceSync().rows("address").single { it.fileId==file.id }.imported)
+    }
+
+    @Test fun privacyFenceSkipsListedAndPersistedPendingSourceWithoutDownloading() = runBlocking {
+        val pending = DeviceTransfer("private-pending","address",file.id,file.name,file.bytes,file.startedAt,
+            file.durationMillis,file.format.name,0,10000,10000)
+        db.deviceSync().save(pending)
+        val plugin = Fake(file)
+        val transfer = DeviceSync("address",root,db,listOf(plugin),{ _,_,_,_ -> fail("privacy-erased source imported") },
+            mayImportSource={false})
+        transfer.importAll(card,link,0)
+        assertTrue(plugin.offsets.isEmpty())
+        assertEquals(pending,db.deviceSync().rows("address").single())
+    }
 
     @Test fun overlapUsesPhoneOffsetAndPadding() {
         assertEquals(DeviceSlice(1000, 8000, 12000), deviceSlice(file, 14000, 17000, 1000, null))
@@ -88,7 +122,7 @@ class DeviceSync120Test {
         val plugin = Fake(file, false).apply { interrupt = true }
         sync(plugin).importAll(card, link, 0)
         sync(plugin).onLinked(card, link, null, null, null)
-        assertEquals(listOf(0L, 0L), plugin.offsets); assertEquals(1, plugin.deleted)
+        assertEquals(listOf(0L, 0L), plugin.offsets); assertEquals(0, plugin.deleted)
     }
     @Test fun threeBadDownloadsNeverImportOrDelete() = runBlocking {
         val plugin = Fake(file).apply { bad = true }
@@ -101,11 +135,11 @@ class DeviceSync120Test {
         sync(plugin) { _, _, _, _ -> fail("校验未通过") }.importAll(card, link, 0)
         assertEquals(listOf(0L, 0L, 0L), plugin.offsets); assertEquals(0, plugin.deleted)
     }
-    @Test fun successfulImportPrecedesDeleteAndDoesNotRepeat() = runBlocking {
+    @Test fun successfulImportNeverImplicitlyDeletesAndDoesNotRepeat() = runBlocking {
         val plugin = Fake(file); var count = 0
         val sync = sync(plugin) { local, _, _, _ -> assertEquals(0, plugin.deleted); assertEquals(4L, local.length()); count++ }
         sync.importAll(card, link, 0); sync.importAll(card, link, 0)
-        assertEquals(1, count); assertEquals(1, plugin.deleted)
+        assertEquals(1, count); assertEquals(0, plugin.deleted)
     }
     @Test fun adjacentGapsDoNotReimportPadding() = runBlocking {
         val plugin = Fake(file); val slices = mutableListOf<DeviceSlice>()
@@ -114,10 +148,60 @@ class DeviceSync120Test {
         sync.onLinked(card, link, 15000, 17000, 0)
         assertEquals(listOf(DeviceSlice(0, 6000, 10000), DeviceSlice(6000, 9000, 16000)), slices)
     }
+    @Test fun liveCoverageIsRecordedAndOnlyUncoveredIntervalsAreImported() = runBlocking {
+        val plugin = Fake(file)
+        val slices = mutableListOf<DeviceSlice>()
+        seedLiveCoverage(db,"address",file,listOf(MillisRange(2000,5000)))
+        sync(plugin) { _,_,slice,_ -> slices += slice }.importAll(card,link,0)
+        assertEquals(setOf(0L to 2000L,5000L to 10000L),slices.map { it.from to it.to }.toSet())
+        assertTrue(db.deviceSync().rows("address").all { it.imported })
+        assertEquals(0,plugin.deleted)
+        assertEquals(listOf(0L),plugin.offsets) // Both missing ranges share one validated physical download.
+    }
+    @Test fun completeLiveCoverageStillArchivesWithoutDuplicatingTimeline() = runBlocking {
+        val plugin = Fake(file);var archived = false
+        seedLiveCoverage(db,"address",file,listOf(MillisRange(0,10000)))
+        val sync = DeviceSync("address",root,db,listOf(plugin),
+            ingest = { _,_,_,_ -> fail("完整实时覆盖不能重复导入") },
+            needsArchive = { !archived },onVerifiedSource = { _,source,hash ->
+                assertArrayEquals(byteArrayOf(1,2,3,4),source.readBytes())
+                assertEquals(DeviceSourceCache.sha256(source),hash);archived = true
+            })
+        sync.importAll(card,link,0);sync.importAll(card,link,0)
+        assertTrue(archived);assertEquals(listOf(0L),plugin.offsets);assertEquals(0,plugin.deleted)
+        assertTrue(db.deviceSync().rows("address").all { it.imported })
+    }
+    @Test fun crashRecoveryUsesPersistedSegmentsAndSpoolWithoutAssumingClockOffset() = runBlocking {
+        val source = "CardDevice:device:a:1000:11000"
+        val values = mutableMapOf("audioAnchor:$source" to "1000|11000|11040|a")
+        val store = object : DriverStore {
+            override fun getString(key:String) = values[key]
+            override fun putString(key:String,value:String?) { if (value == null) values.remove(key) else values[key] = value }
+            override fun getBytes(key:String):ByteArray? = null
+            override fun putBytes(key:String,value:ByteArray?) {}
+            override fun keys():Set<String> = values.keys
+        }
+        db.capture().segment(SegmentEntity(startAt=12010,endAt=13020,sourceId=source,path="one.ogg",sizeBytes=1))
+        db.capture().segment(SegmentEntity(startAt=12010,endAt=13020,sourceId="other",path="two.ogg",sizeBytes=1))
+        val spool = File(root,"spool").apply { mkdirs() }
+        File(spool,"14000_piece.source").writeText(source)
+        File(spool,"14000_piece.pcm").writeBytes(ByteArray(32000))
+        assertEquals(setOf(MillisRange(2020,2980),MillisRange(4000,4960)),
+            recoverDriverCoverage(db,spool,file.copy(format=FileFormat.Opus),store).toSet())
+    }
     @Test fun importFailureRetainsSource() = runBlocking {
         val plugin = Fake(file)
         sync(plugin) { _, _, _, _ -> error("failed") }.importAll(card, link, 0)
         assertEquals(0, plugin.deleted); assertFalse(db.deviceSync().rows("address").single().imported)
+        sync(plugin).importAll(card,link,0)
+        assertEquals(listOf(0L),plugin.offsets) // A new coordinator reuses the full SHA-256-verified cache.
+    }
+    @Test fun corruptedCompleteCacheIsRedownloadedRatherThanResumedAtEof() = runBlocking {
+        val plugin = Fake(file)
+        sync(plugin) { _,_,_,_ -> error("import failed") }.importAll(card,link,0)
+        File(root,deviceSourceKey("address",file)).writeBytes(byteArrayOf(9,9,9,9))
+        sync(plugin) { local,_,_,_ -> assertArrayEquals(byteArrayOf(1,2,3,4),local.readBytes()) }.importAll(card,link,0)
+        assertEquals(listOf(0L,0L),plugin.offsets)
     }
     @Test fun sharedFingerprintSkipsWithoutUnsafeDelete() = runBlocking {
         val plugin = Fake(file)
@@ -138,10 +222,10 @@ class DeviceSync120Test {
     @Test fun protocolMatchesRealDownloadFrameAndReassembles() {
         val expected = "5a 03 9e 20 1e 00 02 02 00 00 00 00 6e 6f 74 65 32 30 32 36 30 37 31 30 2d 31 36 32 39 33 38 2e 77 61 76 00"
             .split(" ").map { it.toInt(16).toByte() }.toByteArray()
-        val frames = FileFrames()
+        val frames = SyntheticFileFrames()
         repeat(3) { frames.command(0) }
         assertArrayEquals(expected, frames.download("note20260710-162938.wav"))
-        val parser = FileFrames.Parser()
+        val parser = SyntheticFileFrames.Parser()
         assertTrue(parser.feed(expected.copyOfRange(0, 10)).isEmpty())
         assertArrayEquals(expected.copyOfRange(6, 36), parser.feed(expected.copyOfRange(10, 36)).single())
     }
@@ -149,48 +233,20 @@ class DeviceSync120Test {
         // 官方真实抓包，用于独立核对 CRC，而非用待测编码器自证。
         val packet = "5a 03 9e 20 1e 00 02 02 00 00 00 00 6e 6f 74 65 32 30 32 36 30 37 31 30 2d 31 36 32 39 33 38 2e 77 61 76 00"
             .split(" ").map { it.toInt(16).toByte() }.toByteArray()
-        val parser = FileFrames.Parser()
+        val parser = SyntheticFileFrames.Parser()
         val result = parser.feed(byteArrayOf(0, 1) + packet + packet + packet.copyOfRange(0, 5))
         assertEquals(2, result.size)
         result.forEach { assertArrayEquals(packet.copyOfRange(6, packet.size), it) }
         assertEquals(1, parser.feed(packet.copyOfRange(5, packet.size)).size)
         val corrupt = packet.copyOf().also { it[it.lastIndex] = 1 }
-        assertThrows(IllegalStateException::class.java) { FileFrames.Parser().feed(corrupt) }
-        assertThrows(IllegalArgumentException::class.java) { FileFrames.Parser().feed(byteArrayOf(0x5a, 0, 0, 0, 1, 0x20)) }
+        assertThrows(IllegalStateException::class.java) { SyntheticFileFrames.Parser().feed(corrupt) }
+        assertThrows(IllegalArgumentException::class.java) { SyntheticFileFrames.Parser().feed(byteArrayOf(0x5a, 0, 0, 0, 1, 0x20)) }
     }
 
-    @Test fun pluginListsTruncatedNamesAndWritesDownloadOnce() = runBlocking {
-        val notifications = MutableSharedFlow<ByteArray>()
-        val writes = mutableListOf<ByteArray>()
-        val responses = FileFrames()
-        val fake = object : DeviceLink {
-            override val mtu = 23
-            override suspend fun read(service: String, characteristic: String) = byteArrayOf()
-            override fun notifications(service: String, characteristic: String) = notifications
-            override suspend fun write(service: String, characteristic: String, bytes: ByteArray, withResponse: Boolean) {
-                writes += bytes
-                if (bytes[7] == 0.toByte()) {
-                    val body = ByteBuffer.allocate(32).order(ByteOrder.BIG_ENDIAN).putInt(1).putInt(2).putInt(123)
-                        .put("note20260710-162938.".toByteArray().copyOf(20)).array()
-                    notifications.emit(responses.command(1, body))
-                    notifications.emit(responses.command(18, byteArrayOf(0)))
-                } else {
-                    notifications.emit(responses.command(3))
-                    notifications.emit(responses.command(4, byteArrayOf(1, 2)))
-                    notifications.emit(responses.command(5, byteArrayOf(0)))
-                }
-            }
-        }
-        val plugin = SonicloudFiles()
-        val row = plugin.list(fake).single()
-        assertEquals("note20260710-162938.wav", row.name); assertEquals(2000L, row.durationMillis)
-        assertEquals(listOf(1.toByte(), 2.toByte()), plugin.download(fake, row, 0).toList().single().toList())
-        assertEquals(36, writes.last().size); assertEquals(2, writes.size)
-    }
     @Test fun migrationFrom30PreservesDataAndPersistsTransfers() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val name = "device120-migration.db"; context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/30.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/30.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { i ->
@@ -204,10 +260,10 @@ class DeviceSync120Test {
             repeat(queries.length()) { old.execSQL(queries.getString(it)) }
             old.execSQL("INSERT INTO battery VALUES (1,1000,80,0)"); old.version = 30
         }
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals(80, migrated.capture().batteries(0, 2000).first().single().percent)
             val row = DeviceTransfer("key", "d", "f", "a", 4, 0, 1, "Pcm16", 0, 1, 0, 2)
             migrated.deviceSync().save(row); assertEquals(row, migrated.deviceSync().rows("d").single())

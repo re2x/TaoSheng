@@ -1,6 +1,10 @@
 package app.resound.ui.transcript
 
+import androidx.compose.ui.text.withStyle
+import kotlinx.datetime.toKotlinLocalDate
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.flow.map
+import app.resound.ui.theme.fade
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.TextAutoSize
 import android.widget.Toast
@@ -43,6 +47,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import app.resound.ui.ScrollTopButton
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -58,7 +63,6 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -68,6 +72,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import app.resound.ui.settings.settingsAnchor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
@@ -129,11 +134,11 @@ fun TranscriptScreen(
     var dayOffset by remember { mutableIntStateOf(0) }
     val date = remember(dayOffset) { LocalDate.now().minusDays(dayOffset.toLong()) }
     // 话都已记在语音输入那条里的录音段不显示
-    val segments by remember(date) { repo.day(date).map { day -> day.filterNot { it.status == TranscriptStatus.Done && it.lines.isEmpty() } } }
-        .collectAsState(initial = null)
-    val hasKey by settings.ready.collectAsState()
-    val realtime = (settings as? AndroidTranscribeSettings)?.realtime?.collectAsState()?.value == true
-    val local = (settings as? AndroidTranscribeSettings)?.source?.collectAsState()?.value == TranscribeSource.Local
+    val segments by remember(date) { repo.day(date.toKotlinLocalDate()).map { day -> day.filterNot { it.status == TranscriptStatus.Done && it.lines.isEmpty() } } }
+        .collectAsStateWithLifecycle(initialValue = null)
+    val hasKey by settings.ready.collectAsStateWithLifecycle()
+    val realtime = (settings as? AndroidTranscribeSettings)?.realtime?.collectAsStateWithLifecycle()?.value == true
+    val local = (settings as? AndroidTranscribeSettings)?.source?.collectAsStateWithLifecycle()?.value == TranscribeSource.Local
     var settingsOpen by remember { mutableStateOf(false) }
     // 多选（和首页同一套：长按进入、点选、选到这儿）；换一天就重置
     val selection = remember(date) { app.resound.ui.today.TimelineSelection() }
@@ -147,11 +152,20 @@ fun TranscriptScreen(
         val (d, _) = focus ?: return@LaunchedEffect
         dayOffset = java.time.temporal.ChronoUnit.DAYS.between(d, LocalDate.now()).toInt().coerceAtLeast(0)
     }
+    // 设置搜索命中转写设置 / 热词时先滚过去（区块自己再亮一下描边）
+    val searchAnchor = app.resound.ui.settings.SettingsHighlight.anchor
+    LaunchedEffect(searchAnchor) {
+        when (searchAnchor) {
+            "asr", "local-model", "asr-interval", "retry", "audio-retention", "speakers" -> listState.animateScrollToItem(1)
+            "hotwords" -> if (app.resound.AppGraph.isHotwordsReady) listState.animateScrollToItem(2)
+        }
+    }
     LaunchedEffect(focus, segments) {
         val (d, segId) = focus ?: return@LaunchedEffect
         if (d != date) return@LaunchedEffect
         val i = segments?.indexOfFirst { it.segmentId == segId } ?: return@LaunchedEffect
-        if (i >= 0) { listState.animateScrollToItem(i + 2 + (if (settingsOpen || !hasKey) 1 else 0)); PlayerNav.transcriptFocus = null }
+        // 录音段之前依次是：队列卡、转写设置、[热词]、“录音原话”标题、环境音行
+        if (i >= 0) { listState.animateScrollToItem(i + 4 + (if (app.resound.AppGraph.isHotwordsReady) 1 else 0)); PlayerNav.transcriptFocus = null }
     }
     var viewport by remember { mutableStateOf(androidx.compose.ui.geometry.Rect.Zero) }
     var boxTop by remember { mutableStateOf(0f) }
@@ -162,7 +176,7 @@ fun TranscriptScreen(
         selection.reachTarget(order, viewport.top, minOf(viewport.bottom, bottomEdge)) else null
     val context = LocalContext.current
     val memory = if (app.resound.AppGraph.isMemoryReady) app.resound.AppGraph.memory else null
-    val dayEvents by remember(date, memory) { memory?.events(date) ?: kotlinx.coroutines.flow.flowOf(emptyList()) }.collectAsState(initial = emptyList())
+    val dayEvents by remember(date, memory) { memory?.events(date.toKotlinLocalDate()) ?: kotlinx.coroutines.flow.flowOf(emptyList()) }.collectAsStateWithLifecycle(initialValue = emptyList())
     var exporting by remember { mutableStateOf<Pair<List<Long>, String>?>(null) }
     var deleting by remember { mutableStateOf<List<Long>?>(null) }
     var retranscribing by remember { mutableStateOf<List<Long>?>(null) }
@@ -170,20 +184,21 @@ fun TranscriptScreen(
     val chosen = segments.orEmpty().filter { it.segmentId in selection.ids }.sortedBy { it.startAt }
     Box(Modifier.fillMaxSize().background(c.background).onGloballyPositioned { boxTop = it.boundsInRoot().top }) {
     LazyColumn(
-        Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).onGloballyPositioned { viewport = it.boundsInRoot() },
+        Modifier.fillMaxSize().onGloballyPositioned { viewport = it.boundsInRoot() },
         state = listState,
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = bottomPadding + 24.dp + if (selection.active) 120.dp else 0.dp),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottomPadding + 24.dp + if (selection.active) 120.dp else 0.dp),
         verticalArrangement = Arrangement.spacedBy(22.dp),
     ) {
         item {
-            QueueCard(repo, hasKey, realtime, local, settingsOpen || !hasKey, footer = {
+            QueueCard(repo, hasKey, realtime, local, settingsShown = true, footer = {
                 if (app.resound.AppGraph.isUsageReady) app.resound.ui.settings.AsrUsageRow(app.resound.AppGraph.usage)
                 if (app.resound.AppGraph.isOriginalAudioReady) OriginalAudioRow(app.resound.AppGraph.originalAudio)
                 RecordingPackRow()
             }) { settingsOpen = !settingsOpen }
         }
-        // 收起时不占位置（用列表自带的出现/消失动画）
-        if (settingsOpen || !hasKey) item(key = "settings") { SettingsCard(settings, onSaved = { settingsOpen = false }) }
+        item(key = "settings") { Box(Modifier.settingsAnchor("asr", "local-model", "asr-interval", "retry", "audio-retention", "speakers")) { SettingsCard(settings, onSaved = {}) } }
+        // 热词并进本页（原来是设置首页单独一行）
+        if (app.resound.AppGraph.isHotwordsReady) item(key = "hotwords") { Box(Modifier.settingsAnchor("hotwords")) { HotwordCard(app.resound.AppGraph.hotwords) } }
         item {
             val list = segments.orEmpty()
             Section("录音原话", trailing = {
@@ -214,7 +229,8 @@ fun TranscriptScreen(
             val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
             val id = seg.segmentId
             SegmentCard(seg, Modifier.animateItem().then(if (selection.active) Modifier.trackRow(selection, id) else Modifier),
-                realtime, onTranscribeAnyway = { repo.transcribeAnyway(id) },
+                realtime, onTranscribeAnyway = { digest -> repo.transcribeAnyway(id, digest) },
+                onAllowPlaybackDigest = { repo.allowPlaybackDigest(id) },
                 onRetry = { repo.retrySegment(id) }, onDelete = { repo.deleteFailed(id) },
                 selected = if (selection.active) id in selection.ids else null,
                 onLongPress = {
@@ -225,6 +241,8 @@ fun TranscriptScreen(
           }
         }
     }
+    // 原话很长时滑下去要上滑很久：右侧淡入“↑”，点一下回到顶部；多选时让给底部操作栏
+    if (!selection.active) ScrollTopButton(listState, bottomPadding)
     ReachHereChip(reach, selection, boxTop, reach != null && order.indexOf(reach) < order.indexOf(selection.anchor)) { selection.rangeTo(it, order) }
     // 底部两行：✕ · 已选 N 段 · 共几分钟 · 全选 / 播放 · 导出 · 复制原话 · 删除
     SegmentSelectBar(selection, order, chosen, bottomPadding, onTop = { bottomEdge = it },
@@ -262,7 +280,7 @@ fun TranscriptScreen(
 private fun QueueCard(repo: TranscriptRepository, hasKey: Boolean, realtime: Boolean, local: Boolean, settingsShown: Boolean,
                       footer: @Composable () -> Unit = {}, onToggleSettings: () -> Unit) {
     val c = Rs.colors
-    val q by repo.queue.collectAsState()
+    val q by repo.queue.collectAsStateWithLifecycle()
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -288,8 +306,9 @@ private fun QueueCard(repo: TranscriptRepository, hasKey: Boolean, realtime: Boo
                 Text(it, style = RsType.headline, color = c.text)
             }
             Spacer(Modifier.weight(1f))
-            Text(
-                if (settingsShown) "收起设置" else "模型和转写设置",
+            // 11-12：转写设置在本页直接平铺，不再要点开
+            if (!settingsShown) Text(
+                "模型和转写设置",
                 style = RsType.subhead,
                 color = c.accent,
                 modifier = Modifier.springClick(onToggleSettings).padding(4.dp),
@@ -320,7 +339,7 @@ private fun QueueCard(repo: TranscriptRepository, hasKey: Boolean, realtime: Boo
                         ProgressRing(q.runDone, q.runTotal, c.accent, Modifier.size(14.dp))
                         Spacer(Modifier.width(7.dp))
                     }
-                    Text(if (q.running) runLabel(q.runDone, q.runTotal) else "现在转写", style = RsType.subhead, color = if (q.running) c.accent else Color.White)
+                    Text(if (q.running) runLabel(q.runDone, q.runTotal) else "现在转写", style = RsType.subhead, color = if (q.running) c.accent else c.onAccent)
                 }
                 if (q.failed > 0 && !q.running) {
                     Pill("重试没转成功的", filled = false) { repo.retryFailed() }
@@ -335,10 +354,12 @@ private fun QueueCard(repo: TranscriptRepository, hasKey: Boolean, realtime: Boo
     }
 }
 
-private fun queueDetail(q: TranscribeQueueState, hasKey: Boolean, realtime: Boolean, now: Long): String = when {
+private fun queueDetail(q: TranscribeQueueState, hasKey: Boolean, realtime: Boolean, now: Long): String {
+    val lastError = q.lastError
+    return when {
     !hasKey -> "请配置云端服务，或下载本地模型后开始转写"
     q.running -> "逐段识别中，可以离开这个页面"
-    q.lastError != null -> q.lastError
+    lastError != null -> lastError
     else -> buildString {
         // 实时转写没有“下一轮”：录完就转
         if (realtime) append("录完就转")
@@ -350,6 +371,8 @@ private fun queueDetail(q: TranscribeQueueState, hasKey: Boolean, realtime: Bool
         }
         if (isEmpty()) append("还没有转写过")
     }
+}
+
 }
 
 private fun usage(seconds: Long) = if (seconds in 0..59) "${seconds}秒" else formatDuration(seconds * 1000)
@@ -380,13 +403,13 @@ private fun ProgressSweep(modifier: Modifier) {
 private fun SettingsCard(settings: TranscribeSettings, onSaved: () -> Unit) {
     val c = Rs.colors
     val scope = rememberCoroutineScope()
-    val hasKey by settings.hasKey.collectAsState()
-    val ready by settings.ready.collectAsState()
+    val hasKey by settings.hasKey.collectAsStateWithLifecycle()
+    val ready by settings.ready.collectAsStateWithLifecycle()
     val advanced = settings as? AndroidTranscribeSettings
-    val source = advanced?.source?.collectAsState()?.value ?: TranscribeSource.Doubao
+    val source = advanced?.source?.collectAsStateWithLifecycle()?.value ?: TranscribeSource.Doubao
     val local = source == TranscribeSource.Local
-    val interval by settings.intervalMinutes.collectAsState()
-    val wifiOnly by settings.wifiOnly.collectAsState()
+    val interval by settings.intervalMinutes.collectAsStateWithLifecycle()
+    val wifiOnly by settings.wifiOnly.collectAsStateWithLifecycle()
     var editing by remember(source) { mutableStateOf(false) }
     var input by remember(source) { mutableStateOf("") }
     var testing by remember { mutableStateOf(false) }
@@ -452,7 +475,7 @@ private fun SettingsCard(settings: TranscribeSettings, onSaved: () -> Unit) {
 
         Text("多久转写一次", style = RsType.body, color = c.text)
         Spacer(Modifier.height(10.dp))
-        val realtime = advanced?.realtime?.collectAsState()?.value
+        val realtime = advanced?.realtime?.collectAsStateWithLifecycle()?.value
         IntervalChoice(interval, realtime, { advanced?.setRealtime(it) }) { settings.setIntervalMinutes(it) }
         Spacer(Modifier.height(6.dp))
         Text(when {
@@ -471,19 +494,8 @@ private fun SettingsCard(settings: TranscribeSettings, onSaved: () -> Unit) {
             Toggle(wifiOnly) { settings.setWifiOnly(it) }
         }
 
-        if (app.resound.AppGraph.isPlaybackSkipReady) {
-            val skip by app.resound.AppGraph.playbackSkip.enabled.collectAsState()
-            if (!local) Divider()
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("外放声音时不转写", style = RsType.body, color = c.text)
-                    Text(if (skip) "手机扬声器在放视频、音乐时录到的先不转写，原话里可单段“仍然转写”；戴耳机不受影响"
-                        else "外放时录到的也照常转写，视频里的声音可能混进原话", style = RsType.caption, color = c.textSecondary)
-                }
-                Toggle(skip) { app.resound.AppGraph.playbackSkip.setEnabled(it) }
-            }
-        }
-
+        PlaybackSkipCard(local)
+        PlaybackTitleCard()
         if (app.resound.AppGraph.isAsrSpeedReady) SpeakerOptions()
 
         if (ready) {
@@ -524,10 +536,10 @@ private fun SettingsCard(settings: TranscribeSettings, onSaved: () -> Unit) {
 @Composable
 private fun LocalModelOptions(settings: AndroidTranscribeSettings) {
     val c=Rs.colors
-    val backend by settings.backend.collectAsState()
-    val language by settings.language.collectAsState()
-    val actual by settings.localStatus.collectAsState()
-    val revision by settings.modelRevision.collectAsState()
+    val backend by settings.backend.collectAsStateWithLifecycle()
+    val language by settings.language.collectAsStateWithLifecycle()
+    val actual by settings.localStatus.collectAsStateWithLifecycle()
+    val revision by settings.modelRevision.collectAsStateWithLifecycle()
     val supported=LocalModels.npuSupported()
     Text("SenseVoice · 离线识别", style=RsType.body,color=c.text)
     Text("录音不出手机。按下面“多久转写一次”识别；说话期间模型常驻，安静 6 分钟后释放内存。", style=RsType.caption,color=c.textSecondary)
@@ -540,7 +552,7 @@ private fun LocalModelOptions(settings: AndroidTranscribeSettings) {
     val context=androidx.compose.ui.platform.LocalContext.current
     LocalBackend.entries.filter { it==LocalBackend.Cpu || supported }.forEach { mode ->
         val downloaded=remember(revision,mode){settings.modelReady(mode)}
-        val work by remember(mode){LocalModels.downloadActive(context,LocalModels.workName(mode))}.collectAsState(null)
+        val work by remember(mode){LocalModels.downloadActive(context,LocalModels.workName(mode))}.collectAsStateWithLifecycle(null)
         Spacer(Modifier.height(10.dp))
         Row(verticalAlignment=Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -577,10 +589,10 @@ private fun <T> Choice(options: List<T>, selected: T, label: (T) -> String, fill
     val c = Rs.colors
     // fill：选项多时平分整行、文字放不下自动缩小，不会挤出屏幕或折成竖排
     Row(Modifier.then(if (fill) Modifier.fillMaxWidth() else Modifier).clip(CircleShape)
-        .background(c.separator.copy(alpha = if (c.isDark) 1f else 0.7f)).padding(3.dp)) {
+        .background(c.track).padding(3.dp)) {
         options.forEach { option ->
             val on = option == selected
-            val bg by animateColorAsState(if (on) c.card else c.card.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
+            val bg by animateColorAsState(if (on) c.trackThumb else c.trackThumb.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
             Box(Modifier.then(if (fill) Modifier.weight(1f) else Modifier).clip(CircleShape).background(bg).springClick { onSelect(option) }
                 .padding(horizontal = if (fill) 4.dp else 16.dp, vertical = 7.dp), contentAlignment = Alignment.Center) {
                 if (fill) Text(label(option), style = RsType.subhead, color = if (on) c.text else c.textSecondary, maxLines = 1, softWrap = false,
@@ -623,7 +635,7 @@ internal fun IntervalChoice(interval: Int, realtime: Boolean? = null, onRealtime
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                     modifier = Modifier.width(76.dp),
                     decorationBox = { inner ->
-                        Box(Modifier.clip(CircleShape).background(c.background).padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.clip(CircleShape).background(c.fill).padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
                             if (input.isEmpty()) Text("如 20", style = RsType.body, color = c.textTertiary)
                             inner()
                         }
@@ -649,8 +661,8 @@ private const val REALTIME = -2
 private fun SpeakerOptions() {
     val c = Rs.colors
     val speed = app.resound.AppGraph.asrSpeed
-    val separate by speed.separateSpeakers.collectAsState()
-    val classMode by speed.classMode.collectAsState()
+    val separate by speed.separateSpeakers.collectAsStateWithLifecycle()
+    val classMode by speed.classMode.collectAsStateWithLifecycle()
     Divider()
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
@@ -676,28 +688,25 @@ private fun SpeakerOptions() {
     }
 }
 
-internal fun classModeLine(state: app.resound.transcribe.ClassModeState, now: Long): String = when {
-    !state.enabled -> "适合只有一个人主讲的上课、讲座：这段时间不区分说话人，转写更快，到点自动恢复。其他人插话可能漏转，多人讨论请别开"
-    state.endsAtMillis == null -> "课堂模式中 · 手动结束前不区分说话人"
-    else -> "课堂模式中 · " + java.time.Instant.ofEpochMilli(state.endsAtMillis).atZone(java.time.ZoneId.systemDefault())
-        .toLocalTime().let { "%d:%02d".format(it.hour, it.minute) } + " 自动结束"
+internal fun classModeLine(state: app.resound.transcribe.ClassModeState, now: Long): String {
+    val endsAtMillis = state.endsAtMillis
+    return when {
+        !state.enabled -> "适合只有一个人主讲的上课、讲座：这段时间不区分说话人，转写更快，到点自动恢复。其他人插话可能漏转，多人讨论请别开"
+        endsAtMillis == null -> "课堂模式中 · 手动结束前不区分说话人"
+        else -> "课堂模式中 · " + java.time.Instant.ofEpochMilli(endsAtMillis).atZone(java.time.ZoneId.systemDefault())
+            .toLocalTime().let { "%d:%02d".format(it.hour, it.minute) } + " 自动结束"
+    }
 }
 
 /** 苹果风格开关，暖橙底。 */
 @Composable
-private fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by animateDpAsState(if (on) 20.dp else 0.dp, spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+private fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)
 
 // ---------- 每段录音 ----------
 
 @Composable
-private fun SegmentCard(seg: SegmentTranscript, modifier: Modifier, realtime: Boolean, onTranscribeAnyway: () -> Unit,
+private fun SegmentCard(seg: SegmentTranscript, modifier: Modifier, realtime: Boolean, onTranscribeAnyway: (Int) -> Unit,
+                        onAllowPlaybackDigest: () -> Unit,
                         onRetry: () -> Unit = {}, onDelete: () -> Unit = {},
                         /** 多选时是否选中；不在多选为 null */
                         selected: Boolean? = null, onLongPress: () -> Unit = {}, onTap: () -> Unit = {}) {
@@ -726,15 +735,12 @@ private fun SegmentCard(seg: SegmentTranscript, modifier: Modifier, realtime: Bo
         Spacer(Modifier.height(10.dp))
         AnimatedContent(seg.status, transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(150)) }, label = "segBody") { status ->
             when (status) {
-                TranscriptStatus.Done -> SpeakerLines(seg.lines)
+                TranscriptStatus.Done -> PlaybackHeldDone(seg, onAllowPlaybackDigest)
                 TranscriptStatus.Running -> Placeholder()
                 TranscriptStatus.Pending -> Note(if (realtime) "马上转写" else "等下一轮转写")
                 TranscriptStatus.Empty -> Note("只有声音，没识别出说话内容")
                 TranscriptStatus.Failed -> Note(seg.error ?: "没转成功，可以在上面点重试", c.critical)
-                TranscriptStatus.SkippedPlayback -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    Note("手机外放声音时录的，没有转写", modifier = Modifier.weight(1f))
-                    if (seg.audioAvailable) Pill("仍然转写", filled = false, onClick = onTranscribeAnyway)
-                }
+                TranscriptStatus.SkippedPlayback -> SkippedPlaybackActions(seg, onTranscribeAnyway)
                 // 修不好的：灰色说明 + 删除；不再挂红字提醒
                 TranscriptStatus.Abandoned -> FailedActions(seg.error ?: "录音损坏，无法转写", retry = null, onDelete = onDelete)
                 // 忽略的、或失败超过 3 天的：灰色说明 + 重试 / 删除
@@ -748,21 +754,18 @@ private fun SegmentCard(seg: SegmentTranscript, modifier: Modifier, realtime: Bo
     }
 }
 
+/** 卡 192：外放片段的原声按用户设的保留天数删除，删了就不能“仍然转写”，所以标出还剩几天 */
 @Composable
-private fun StatusChip(seg: SegmentTranscript) {
-    val c = Rs.colors
-    val (text, color) = when (seg.status) {
-        TranscriptStatus.Pending -> "等待中" to c.textTertiary
-        TranscriptStatus.Running -> "转写中" to c.accent
-        TranscriptStatus.Failed -> "没转成功" to c.critical
-        TranscriptStatus.Empty -> "没有文字" to c.textTertiary
-        TranscriptStatus.Done -> if (seg.audioAvailable) return else "录音已删" to c.textTertiary
-        TranscriptStatus.SkippedPlayback -> "外放时录的" to c.textTertiary
-        TranscriptStatus.Abandoned -> "无法转写" to c.textTertiary
-        TranscriptStatus.Quiet -> "已忽略" to c.textTertiary
-    }
-    Box(Modifier.clip(CircleShape).background(color.copy(alpha = 0.12f)).padding(horizontal = 10.dp, vertical = 3.dp)) {
-        Text(text, style = RsType.caption, color = color)
+internal fun skippedAudioHint(seg: SegmentTranscript): String {
+    if (!seg.audioAvailable) return "，原声已删除"
+    if (!app.resound.AppGraph.isOriginalAudioReady) return ""
+    val days by app.resound.AppGraph.originalAudio.retentionDays.collectAsStateWithLifecycle()
+    // 外放片段生成时就算“完成”，完成时间即录音结束时间
+    val left = app.resound.transcribe.originalAudioRemainingDays(seg.endAt, "SkippedPlayback", days, false, System.currentTimeMillis())
+    return when (left) {
+        null -> ""
+        0, 1 -> "，原声 1 天内删除"
+        else -> "，原声还留 $left 天"
     }
 }
 
@@ -783,7 +786,7 @@ private fun FailedActions(reason: String, retry: (() -> Unit)?, onDelete: () -> 
 }
 
 @Composable
-private fun Note(text: String, color: Color = Rs.colors.textTertiary, modifier: Modifier = Modifier) {
+internal fun Note(text: String, color: Color = Rs.colors.textTertiary, modifier: Modifier = Modifier) {
     Text(text, style = RsType.subhead, color = color, modifier = modifier)
 }
 
@@ -825,6 +828,13 @@ fun SpeakerLines(lines: List<TranscriptLine>) {
         value = if (app.resound.AppGraph.isOriginalAudioReady) runCatching {
             app.resound.AppGraph.originalAudio.available(lines.map { it.segmentId }.filter { it > 0 }.toSet())
         }.getOrDefault(emptySet()) else emptySet()
+    }
+    // 卡 205：外放期间的句子标“外放”（只标记、不过滤），有 App/节目名就带上
+    val playbackLines by androidx.compose.runtime.produceState(emptyMap<Long, app.resound.transcribe.SentencePlayback>(), lines) {
+        val source = runCatching { app.resound.AppGraph.playbackSentences }.getOrNull()
+        value = if (source == null) emptyMap() else lines.map { it.segmentId }.filter { it > 0 }.distinct().flatMap { id ->
+            runCatching { source.forSegment(id) }.getOrDefault(emptyList())
+        }.filter { it.playing }.associateBy { it.lineId }
     }
     fun tap(line: TranscriptLine) {
         when {
@@ -881,7 +891,14 @@ fun SpeakerLines(lines: List<TranscriptLine>) {
                             val bg by androidx.compose.animation.animateColorAsState(if (now) c.accentSoft else Color.Transparent, label = "playing")
                             val seen = remember(line.id) { androidx.compose.foundation.relocation.BringIntoViewRequester() }
                             androidx.compose.runtime.LaunchedEffect(now) { if (now) runCatching { seen.bringIntoView() } }
-                            Text(line.text, style = RsType.body, color = if (now) c.accent else c.text, modifier = Modifier.fillMaxWidth()
+                            val heard = playbackLines[line.id]
+                            val shown = if (heard == null) androidx.compose.ui.text.AnnotatedString(line.text) else androidx.compose.ui.text.buildAnnotatedString {
+                                withStyle(androidx.compose.ui.text.SpanStyle(color = c.textTertiary, fontSize = RsType.caption.fontSize, background = c.fill)) {
+                                    append(" 外放" + (listOfNotNull(heard.appName, heard.title).firstOrNull()?.let { " · ${it.take(12)}" } ?: "") + " ")
+                                }
+                                append("  "); append(line.text)
+                            }
+                            Text(shown, style = RsType.body, color = if (now) c.accent else c.text, modifier = Modifier.fillMaxWidth()
                                 .bringIntoViewRequester(seen).clip(RoundedCornerShape(8.dp)).background(bg).combinedClickable(
                                 interactionSource = remember(line.id) { MutableInteractionSource() }, indication = null,
                                 onClick = { tap(line) }, onLongClick = { menuFor = line.id },
@@ -934,7 +951,7 @@ private fun VoiceInputContext(v: app.resound.transcribe.VoiceInputMeta) {
     if (v.before == null && v.after == null) return
     var open by remember { mutableStateOf(false) }
     Column(Modifier.padding(top = 4.dp).fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
-        .background(c.background).springClick { open = !open }.padding(horizontal = 12.dp, vertical = 8.dp)) {
+        .background(c.fill).springClick { open = !open }.padding(horizontal = 12.dp, vertical = 8.dp)) {
         Text(if (open) "当时的上下文 · 收起" else "当时的上下文 · 点开看", style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.textSecondary)
         androidx.compose.animation.AnimatedVisibility(open) {
             Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -995,7 +1012,7 @@ private fun Placeholder() {
     val a by t.animateFloat(0.35f, 0.8f, infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Reverse), label = "a")
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         listOf(1f, 0.62f).forEach { w ->
-            Box(Modifier.fillMaxWidth(w).height(12.dp).clip(CircleShape).background(c.separator.copy(alpha = a)))
+            Box(Modifier.fillMaxWidth(w).height(12.dp).clip(CircleShape).background(c.separator.fade(a)))
         }
     }
 }
@@ -1021,9 +1038,9 @@ private fun BoxScope.SegmentSelectBar(selection: app.resound.ui.today.TimelineSe
             }
             Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 BarAction("▶ 播放", c.accentSoft, c.accent, n > 0, Modifier.weight(1f), onPlay)
-                BarAction("导出", c.accent, Color.White, n > 0, Modifier.weight(1f), onExport)
-                BarAction("复制", c.background, c.text, n > 0, Modifier.weight(1f), onCopy)
-                if (app.resound.AppGraph.isRedoReady) BarAction("重新转写", c.background, c.text, n > 0, Modifier.weight(1.4f), onRetranscribe)
+                BarAction("导出", c.accent, c.onAccent, n > 0, Modifier.weight(1f), onExport)
+                BarAction("复制", c.fill, c.text, n > 0, Modifier.weight(1f), onCopy)
+                if (app.resound.AppGraph.isRedoReady) BarAction("重新转写", c.fill, c.text, n > 0, Modifier.weight(1.4f), onRetranscribe)
                 BarAction("删除", c.critical.copy(alpha = 0.1f), c.critical, n > 0, Modifier.weight(1f), onDelete)
             }
         }

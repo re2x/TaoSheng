@@ -1,5 +1,6 @@
 package app.resound.topic
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -22,7 +23,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.SQLiteMode
 import java.io.File
-import java.time.DayOfWeek
+import kotlinx.datetime.DayOfWeek
 import java.time.ZoneId
 import java.time.ZonedDateTime
 
@@ -36,9 +37,9 @@ class Topic135Test {
     private lateinit var repo: RoomTopicRepository
     private var time = 10_000_000L
     @Before fun setup() {
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        repo = RoomTopicRepository(db, scope, { time }, { ZoneId.of("Asia/Shanghai") }, quiet = { _, _ -> true }, recordingEnabled = { false })
+        repo = RoomTopicRepository(db, scope, { time }, { "Asia/Shanghai" }, quiet = { _, _ -> true }, recordingEnabled = { false })
     }
     @After fun close() { runBlocking { scope.coroutineContext[Job]!!.cancelAndJoin() }; db.close() }
     private suspend fun line(id: Long, at: Long, text: String = "我会提交报告", status: String = "Done", digested: Long? = null, event: Long? = null) {
@@ -78,7 +79,7 @@ class Topic135Test {
 
     @Test fun migration32AndBothBackupFormsKeepTopicsAndOldBackupCompatibility() = runBlocking {
         val name = "topic135-v32.db"; context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/32.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/32.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, 0, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { i ->
@@ -93,9 +94,9 @@ class Topic135Test {
         }
         val work = File(context.cacheDir, "topic135-backup").apply { deleteRecursively(); mkdirs() }
         val legacy = File(work, "legacy.db"); context.getDatabasePath(name).copyTo(legacy)
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).addMigrations(*CaptureDatabase.MIGRATIONS).build()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals("old.ogg", migrated.transcribe().segment(1).path)
             val id = migrated.topics().insert(TopicRow(kind = "Training", name = "培训", status = "Ended", createdAt = time, repeatRule = 5, quietOverride = true, revision = 3))
             migrated.topics().span(TopicSpanRow(topicId = id, startAt = 1000, endAt = 2000))
@@ -109,7 +110,7 @@ class Topic135Test {
             val restored = CaptureDatabase.open(context, target.path)
             try { assertEquals(migrated.topics().get(id), restored.topics().get(id)) } finally { restored.close() }
             val oldBackup = CaptureDatabase.open(context, legacy.path)
-            try { assertEquals(CaptureDatabase.VERSION, oldBackup.openHelper.writableDatabase.version); assertTrue(oldBackup.topics().all().isEmpty()) }
+            try { assertEquals(CaptureDatabase.VERSION, oldBackup.testSql.version); assertTrue(oldBackup.topics().all().isEmpty()) }
             finally { oldBackup.close() }
             // 老分卷不含三张新表，恢复到最新 schema 仍合法。
             val oldState = File(work, "old-state.jsonl").apply { writeText("") }
@@ -171,7 +172,7 @@ class Topic135Test {
     @Test fun overlappingLiveRetroactiveAndFutureWeeklyReservationsAreRejected() = runBlocking {
         val future = time + 10 * 86_400_000L
         val day = java.time.Instant.ofEpochMilli(future).atZone(ZoneId.of("Asia/Shanghai")).dayOfWeek
-        assertTrue(repo.schedule(TopicKind.Meeting, null, future, future + 60_000, setOf(day)).isSuccess)
+        assertTrue(repo.schedule(TopicKind.Meeting, null, future, future + 60_000, setOf(DayOfWeek.valueOf(day.name))).isSuccess)
         assertTrue(repo.schedule(TopicKind.Meeting, null, future + 7 * 86_400_000L, future + 7 * 86_400_000L + 60_000).isFailure)
         val saturday = ZonedDateTime.of(2027, 1, 2, 9, 0, 0, 0, ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
         assertTrue(repo.schedule(TopicKind.Meeting, null, saturday, saturday + 60 * 60 * 60_000L,
@@ -244,6 +245,19 @@ class Topic135Test {
         assertTrue(TopicNotifications.line(db.topics().get(id)!!.topic(), time).contains("已暂停"))
     }
 
+    // 卡 169：标错的重点可以删；只删本专题的；已取消的专题不能删
+    @Test fun unmarkRemovesOnlyThatMarkAndRejectsCancelledTopic() = runBlocking {
+        val id = repo.start(TopicKind.Meeting, "周会", 60).topicId!!
+        time += 60_000; repo.mark(); time += 60_000; repo.mark()
+        val marks = repo.observe(id).first()!!.marks
+        assertEquals(2, marks.size)
+        repo.unmark(id, marks.first().id)
+        assertTrue(runCatching { repo.unmark(id + 999, marks.last().id) }.isFailure)   // 不存在的专题：报错，不误删
+        assertEquals(listOf(marks.last().id), repo.observe(id).first()!!.marks.map { it.id })
+        repo.cancel(id)
+        assertTrue(runCatching { repo.unmark(id, marks.last().id) }.isFailure)
+    }
+
     @Test fun multipleBatchesBecomeOneEventAndMarksReachReusedSummaryTemplate() = runBlocking {
         val start = time; val id = repo.start(TopicKind.Meeting, "项目例会", 60).topicId!!
         // 602 行减去暂停中的一句，跨过 DigestRunner 的 600 行批上限。
@@ -265,9 +279,9 @@ class Topic135Test {
         val event = db.memory().event(topic.row.eventId!!)!!
         assertEquals("项目例会", event.title); assertEquals(topic.spans.minOf { it.startAt }, event.startAt)
         assertEquals(time, event.endAt)
-        assertEquals(1, db.openHelper.writableDatabase.query("SELECT COUNT(*) FROM memory_events").use { it.moveToFirst(); it.getInt(0) })
+        assertEquals(1, db.testSql.query("SELECT COUNT(*) FROM memory_events").use { it.moveToFirst(); it.getInt(0) })
         assertTrue(calls.count { !it.first.contains("必须恰好输出一张") } >= 2)
-        assertTrue(calls.filter { it.first.contains("必须恰好输出一张") }.all { it.second.contains("用户标记的重点时刻") && it.second.contains("★ 重点") && it.second.contains("项目例会") })
+        assertTrue(calls.filter { it.first.contains("必须恰好输出一张") }.all { it.second.contains("用户打点区间") && it.second.contains("★ 重点") && it.second.contains("项目例会") })
         assertEquals("import_meeting", db.skills().card(topic.row.cardId!!).first()!!.skillId)
         assertEquals(601, db.memory().eventLines(event.id).first().size)
     }
@@ -315,18 +329,90 @@ class Topic135Test {
         assertEquals(listOf(2L), db.memory().undigestedLines().map { it.id })
         assertNull(db.memory().event(old.eventId!!)); assertNull(db.skills().card(old.cardId!!).first())
         engine().run(); val new = db.topics().get(id)!!.row
-        assertEquals(listOf(1L, 3L), db.memory().eventLines(new.eventId!!).first().map { it.id })
+        val newEventId = new.eventId
+        assertEquals(listOf(1L, 3L), db.memory().eventLines(newEventId!!).first().map { it.id })
         repo.cancel(id)
         assertEquals("Cancelled", db.topics().get(id)!!.row.status)
         assertEquals(listOf(1L, 2L, 3L), db.memory().undigestedLines().map { it.id })
-        assertNull(db.memory().event(new.eventId)); assertNull(db.skills().card(new.cardId!!).first())
+        assertNull(db.memory().event(newEventId)); assertNull(db.skills().card(new.cardId!!).first())
+    }
+
+    @Test fun failedHistoryWithoutEventCanRetryExistingSpeechExactlyOnce() = runBlocking {
+        line(1, time - 1000, "已有原话")
+        val id = ended()
+        engine(generator { _, _ -> throw LlmException(LlmError.Auth) }).run()
+        val failed = repo.observeHistory().first().first()
+        assertEquals(id, failed.id)
+        assertEquals(TopicStatus.Failed, failed.status)
+        assertNull(failed.eventId)
+        val original = db.topics().lines(id)
+        repo.regenerate(id)
+        engine().run()
+        val done = repo.observeHistory().first().first()
+        assertEquals(TopicStatus.Done, done.status)
+        assertNotNull(done.eventId)
+        assertEquals(original.map { it.text }, db.topics().lines(id).map { it.text })
+        engine().run()
+        assertEquals(done.eventId, db.topics().get(id)!!.row.eventId)
+    }
+
+    @Test fun twoHourMeetingContinuesAfterRestartWithoutRepeatingCompletedBlocks() = runBlocking {
+        val checkpoints = TopicCheckpointFiles(context)
+        checkpoints.remove(1)
+        val start = time
+        val id = repo.start(TopicKind.Meeting, "两小时会议", null).topicId!!
+        repeat(32) { n -> line(n + 1L, start + n * 225_000L, "第${n}段讨论。" + "会议内容".repeat(if (n == 0) 800 else 80)) }
+        time += 2 * 3600_000L; repo.end()
+        var fail = true; var firstNoteCalls = 0
+        val gen = generator { system, user ->
+            if (system.contains("必须恰好输出一张")) {
+                if (user.contains("第 1/")) firstNoteCalls++
+                if (fail && user.contains("第 2/")) throw LlmException(LlmError.Network)
+                cardReply()
+            } else digestReply(user)
+        }
+        TopicEngine(db, repo, gen, now = { time }, checkpoints = checkpoints).run()
+        assertEquals("Failed", db.topics().get(id)!!.row.status)
+        assertTrue(checkpoints.read(id)!!.progress.notes.isNotEmpty())
+        fail = false; repo.regenerate(id)
+        val restoredStore = TopicCheckpointFiles(context)
+        TopicEngine(db, repo, gen, now = { time }, checkpoints = restoredStore).run()
+        assertEquals("Done", db.topics().get(id)!!.row.status)
+        assertEquals(1, firstNoteCalls)
+        assertEquals(32, db.memory().eventLines(db.topics().get(id)!!.row.eventId!!).first().size)
+        checkpoints.remove(id)
+    }
+
+    @Test fun failedRegenerationKeepsPreviousFinishedEvent() = runBlocking {
+        line(1, time - 1000); val id = ended()
+        engine().run(); val old = db.topics().get(id)!!.row.eventId!!
+        db.memory().setStarred(old, true, time)
+        repo.regenerate(id)
+        assertNotNull(db.memory().event(old))
+        engine(generator { _, _ -> throw LlmException(LlmError.Auth) }).run()
+        assertEquals(old, db.topics().get(id)!!.row.eventId)
+        assertNotNull(db.memory().event(old))
+        repo.regenerate(id); engine().run()
+        assertTrue(db.memory().event(db.topics().get(id)!!.row.eventId!!)!!.starred)
+    }
+
+    @Test fun checkpointCannotExposeResultsAfterSourceChangedOrDeleted() = runBlocking {
+        var source: String? = "original"
+        val files = TopicCheckpointFiles(context) { source }
+        files.write(999, TopicCheckpoint("original", progress = TopicProgress(notes = mapOf("one" to "分段内容"))))
+        source = "edited"
+        assertNull(files.read(999))
+        files.write(999, TopicCheckpoint("edited"))
+        source = null
+        assertNull(files.read(999))
+        try { files.write(999, TopicCheckpoint("edited")); fail("已删除来源不能写回") } catch (_: TopicException) { }
     }
 
     @Test fun failedGenerationHasFixedMessageAndRevisionRejectsStaleNetworkResult() = runBlocking {
         line(1, time - 1000); val id = ended()
         engine(generator { _, _ -> throw IllegalStateException("不能写进错误的原话和名字") }).run()
         assertEquals("Failed", db.topics().get(id)!!.row.status)
-        assertEquals(TopicPolicy.GENERATION_ERROR, db.topics().get(id)!!.row.error)
+        assertEquals("本地处理未完成，请重试", db.topics().get(id)!!.row.error)
         repo.regenerate(id)
         engine(generator { _, user -> repo.cancel(id); digestReply(user) }).run()
         assertEquals("Cancelled", db.topics().get(id)!!.row.status)
@@ -335,7 +421,7 @@ class Topic135Test {
         assertEquals("Done", db.topics().get(id2)!!.row.status)
     }
 
-    @Test fun rejectedContentIsSplitAfterOneConfigurationProbeAndRemainingSpeechIsKept() = runBlocking {
+    @Test fun rejectedContentStaysIncompleteAndAllOriginalSpeechIsKept() = runBlocking {
         val start = time; val id = repo.start(TopicKind.Normal, null, 15).topicId!!
         repeat(16) { i -> line(i + 1L, start + i * 1000, if (i == 0) "拒收标记" else "正常原话") }
         time += 20_000; repo.end(); var probes = 0
@@ -344,9 +430,9 @@ class Topic135Test {
             user.contains("拒收标记") -> throw LlmException(LlmError.Server, 400)
             else -> digestReply(user)
         } }).run()
-        assertEquals(1, probes); val topic = db.topics().get(id)!!; assertEquals("Done", topic.row.status)
-        assertTrue(db.memory().event(topic.row.eventId!!)!!.summary.contains("部分原话被模型拒收"))
-        assertEquals(16, db.memory().eventLines(topic.row.eventId).first().size)
+        assertEquals(0, probes); val topic = db.topics().get(id)!!; assertEquals("Failed", topic.row.status)
+        assertNull(topic.row.eventId)
+        assertEquals(16, db.topics().lines(id).size)
     }
 
     @Test fun truncatedLargeResponseSplitsWithoutCreatingSeveralEvents() = runBlocking {

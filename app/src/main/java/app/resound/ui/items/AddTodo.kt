@@ -1,5 +1,6 @@
 package app.resound.ui.items
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -35,7 +36,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -241,7 +241,7 @@ private val CANCELLED = Any()
 @Composable
 private fun StatusCard(phase: Phase, cancelArmed: Boolean, voice: TodoVoiceInput, noun: String) {
     val c = Rs.colors
-    val level by voice.level.collectAsState()
+    val level by voice.level.collectAsStateWithLifecycle()
     var seconds by remember(phase) { mutableIntStateOf(0) }
     LaunchedEffect(phase) { if (phase == Phase.Listening) while (true) { delay(1000); seconds++ } }
     val bg by animateColorAsState(if (cancelArmed) c.critical else c.card, label = "statusBg")
@@ -271,13 +271,13 @@ private fun StatusCard(phase: Phase, cancelArmed: Boolean, voice: TodoVoiceInput
 
 /** 打字添加：写一句话，交给模型拆成卡 */
 @Composable
-private fun TypeSheet(words: AddWords, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
+internal fun TypeSheet(words: AddWords, onDismiss: () -> Unit, onSubmit: (String) -> Unit) {
     val c = Rs.colors
     var text by remember { mutableStateOf("") }
     RsSheet(words.typeTitle, words.typeSubtitle, onDismiss = onDismiss) {
         BasicTextField(text, { text = it.take(500) }, textStyle = RsType.body.copy(color = c.text), cursorBrush = SolidColor(c.accent),
             minLines = 3,
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(horizontal = 16.dp, vertical = 14.dp),
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(horizontal = 16.dp, vertical = 14.dp),
             decorationBox = { inner ->
                 Box {
                     if (text.isEmpty()) Text(words.typeExample, style = RsType.body, color = c.textTertiary)
@@ -289,7 +289,7 @@ private fun TypeSheet(words: AddWords, onDismiss: () -> Unit, onSubmit: (String)
 }
 
 /** 一张卡可编辑的内容；时间拆成哪天 + 几点，和编辑待办一样 */
-private class DraftState(d: TodoDraft) {
+private class DraftState(d: TodoDraft, defaultDay: LocalDate? = null) {
     var category by mutableStateOf(d.category)
     var kind by mutableStateOf(d.kind)
     var content by mutableStateOf(d.content)
@@ -304,6 +304,7 @@ private class DraftState(d: TodoDraft) {
             day = at.toLocalDate()
             time = at.toLocalTime().takeIf { (d.dueText?.length ?: 0) > 10 }
         }
+        if (day == null) day = defaultDay
         strong = time != null
     }
 
@@ -322,15 +323,17 @@ private val TYPES = listOf("我要做" to "待办", "我答应别人" to "待办
 /** 确认待办卡：每张可改、可删，确认后一起加进“进行中” */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun DraftSheet(drafts: TodoDrafts, source: String, onDismiss: () -> Unit, onConfirm: (List<TodoDraft>) -> Unit) {
+internal fun DraftSheet(drafts: TodoDrafts, source: String, onDismiss: () -> Unit, defaultDay: LocalDate? = null, onConfirm: (List<TodoDraft>) -> Unit) {
     val c = Rs.colors
-    val cards = remember(drafts) { mutableStateListOf(*drafts.items.map(::DraftState).toTypedArray()) }
+    val cards = remember(drafts) { mutableStateListOf(*drafts.items.map { DraftState(it, defaultDay) }.toTypedArray()) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var toCalendar by remember { mutableStateOf(false) }
     RsSheet(if (cards.size > 1) "生成了 ${cards.size} 条待办" else "确认待办",
         if (drafts.parsed) "改好后点添加，直接放进“进行中”。" else "没能自动识别，已按原话生成，改好后点添加。",
         onDismiss = onDismiss, fixedHeight = true) {
         Text("“$source”", style = RsType.caption, color = c.textTertiary, maxLines = 3)
         cards.forEachIndexed { i, card ->
-            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.background).padding(14.dp),
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.fill).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(if (cards.size > 1) "第 ${i + 1} 条" else "内容", style = RsType.caption, color = c.textSecondary, modifier = Modifier.weight(1f))
@@ -350,8 +353,12 @@ internal fun DraftSheet(drafts: TodoDrafts, source: String, onDismiss: () -> Uni
             }
         }
         val valid = cards.isNotEmpty() && cards.all { it.content.isNotBlank() && !(it.strong && it.time == null) }
+        // 只有一条且定了日子时：顺手加到手机日历（打开系统日历的新建页，点保存才算）
+        if (cards.size == 1 && cards[0].day != null) Choice("📅 同时加到手机日历", toCalendar) { toCalendar = !toCalendar }
         ActionButton(if (cards.size > 1) "添加 ${cards.size} 条" else "添加", ActionKind.Primary, enabled = valid) {
-            onConfirm(cards.map { it.toDraft() })
+            val result = cards.map { it.toDraft() }
+            if (toCalendar && result.size == 1 && result[0].dueAt != null) SystemCalendar.add(context, result[0])
+            onConfirm(result)
         }
     }
 }

@@ -1,5 +1,7 @@
 package app.resound.push
 
+import kotlinx.datetime.toKotlinLocalDate
+import kotlinx.datetime.toKotlinLocalDate
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -36,6 +38,9 @@ import javax.crypto.spec.SecretKeySpec
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], manifest = Config.NONE, application = Application::class)
 class PushMoreTest {
+    @org.junit.Before fun currentZoneFixture() { app.resound.platform.HistoricalZones.history = { app.resound.platform.ZoneHistory(emptyList(), ZoneId.systemDefault().id) } }
+    @org.junit.After fun resetZoneFixture() { app.resound.platform.HistoricalZones.history = { app.resound.platform.ZoneHistory(emptyList(), kotlinx.datetime.TimeZone.currentSystemDefault().id) } }
+
     private val context: Context get() = RuntimeEnvironment.getApplication()
     private val date = LocalDate.parse("2026-10-24")
     private val at = 1_700_000_000_000L
@@ -43,7 +48,7 @@ class PushMoreTest {
     private val hook = mapOf("url" to "http://100.64.1.2/hook")
     private val database = "0123456789abcdef0123456789abcdef"
     private val notion = mapOf("token" to "fake-notion-token", "databaseId" to database)
-    private fun document(markdown: String = "# 记忆\n- 要点\n> 原话") = message.copy(title = "每日记忆文档 · $date", body = "回顾简洁版", topic = PushTopic.DailyMemory,
+    private suspend fun document(markdown: String = "# 记忆\n- 要点\n> 原话") = message.copy(title = "每日记忆文档 · $date", body = "回顾简洁版", topic = PushTopic.DailyMemory,
         memory = dailyMemoryJson(date, at, markdown, null, ReviewInput(emptyList(), emptyList()), emptyList(), null))
 
     private class Fake : AutoCloseable {
@@ -107,7 +112,7 @@ class PushMoreTest {
             assertTrue(request.path!!.endsWith("sendDocument")); assertTrue(body.contains("记忆-$date.md")); assertTrue(body.contains("# 记忆")); assertTrue(body.contains("已截断"))
         }
     }
-    @Test fun smtpLocalAuthDataTlsModesAndMimeAttachment() {
+    @Test fun smtpLocalAuthDataTlsModesAndMimeAttachment() = kotlinx.coroutines.runBlocking {
         ServerSocket(0, 2, java.net.InetAddress.getLoopbackAddress()).use { server ->
             val executor = Executors.newSingleThreadExecutor()
             val received = executor.submit<List<String>> {
@@ -227,15 +232,15 @@ class PushMoreTest {
         }
     }
     private fun event(id: Long = 1, start: Long = at) = MemoryEventEntity(id, start, start + 1000, "会议", "讨论方案", "摘要", "[\"要点\"]", "[\"小王\"]", null, null, null, true, false, start, "test")
-    private fun card() = SkillCard(1, "meeting", "会议纪要", "meeting", date, at, null, "方案会", "会议摘要",
+    private fun card() = SkillCard(1, "meeting", "会议纪要", "meeting", date.toKotlinLocalDate(), at, null, "方案会", "会议摘要",
         listOf(SkillField("points", "要点", FieldType.Bullets, ""), SkillField("todo", "清单", FieldType.Checklist, ""), SkillField("quotes", "原话", FieldType.Quotes, "")),
         mapOf("points" to FieldValue(items = listOf("报价")), "todo" to FieldValue(items = listOf("发送"), checked = listOf(true)), "quotes" to FieldValue(quotes = listOf(CardQuote(1, "我", at, "引用\n下一行")))), listOf(1), at, false)
-    @Test fun dailyJsonHasCompleteFieldsAndOptionalLinesSurviveRetrySnapshot() {
+    @Test fun dailyJsonHasCompleteFieldsAndOptionalLinesSurviveRetrySnapshot() = kotlinx.coroutines.runBlocking {
         val input = ReviewInput(listOf(event()), listOf(MemoryItemEntity(1, 1, "待办", "我要做", "发报价", null, at, "小王", 1, "Accepted", at)))
-        val review = DailyReview(date, "简述", listOf(ReviewSection("一句话", listOf("内容"), listOf(1))), at)
+        val review = DailyReview(date.toKotlinLocalDate(), "简述", listOf(ReviewSection("一句话", listOf("内容"), listOf(1))), at)
         val lines = listOf(TranscriptLineEntity(1, 1, at, at + 1000, "原句", "speaker1", "我"))
         val j = dailyMemoryJson(date, at, "# 文档", review, input, listOf(card()), lines)
-        assertEquals(setOf("type", "version", "app", "date", "generatedAt", "markdown", "data"), j.keys().asSequence().toSet())
+        assertEquals(setOf("type", "version", "app", "date", "generatedAt", "markdown", "data", "utcOffset"), j.keys().asSequence().toSet())
         val data = j.getJSONObject("data")
         assertEquals(setOf("review", "events", "items", "cards", "lines"), data.keys().asSequence().toSet())
         assertEquals(setOf("id", "start", "end", "title", "summary", "scene", "people", "important", "starred"), data.getJSONArray("events").getJSONObject(0).keys().asSequence().toSet())
@@ -249,7 +254,7 @@ class PushMoreTest {
         override suspend fun send(title: String, body: String, deepLink: String?, topic: PushTopic?) {}
     }
     @Test fun diaryAndDailySourceIncludeTypedCardsAndUseReviewCutoffWindow() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
             val zone = ZoneId.systemDefault()
@@ -267,10 +272,10 @@ class PushMoreTest {
             db.skills().save(SkillCardRow(skillId = c.skillId, skillVersion = 1, skillName = c.skillName, icon = c.icon, date = date.toEpochDay(), entity = "day", at = c.at, endAt = null, title = c.title, summary = c.summary,
                 fieldsJson = SkillJson.fields(c.fields).toString(), valuesJson = SkillJson.values(c.values).toString(), evidenceJson = "[]", generatedAt = cutoff, manual = false))
             val llm = LlmClient(); val settings = AndroidDigestSettings(context, llm)
-            val memory = RoomMemoryRepository(db.memory(), DigestRunner(context, db.memory(), llm, settings, { "" }, { false }), { error("不能触发整理") }, scope)
+            val memory = RoomMemoryRepository(db.memory(), DigestRunner(context, db.memory(), llm, settings, { "" }, { false }), { error("不能触发整理") }, scope, zoneProvider = app.resound.platform.ZoneProvider { java.time.ZoneId.systemDefault().id }, now = app.resound.platform.SystemNow, io = Dispatchers.IO)
             val reviews = RoomReviewRepository(db.review(), db.memory(), context.getSharedPreferences("diary-review", 0), scope,
-                { error("不能调用模型") }, { _, _, _, _ -> error("不能调用模型") }, { "" }, "回响", quietNotifier, {})
-            val diary = LocalDiaryRepository(context, memory, reviews, db.memory(), cards = { d -> db.skills().cards(d.toEpochDay()).first().map { it.card() } })
+                { error("不能调用模型") }, { _, _, _, _ -> error("不能调用模型") }, { "" }, "回响", quietNotifier, {}, now = app.resound.platform.SystemNow::now, zone = java.time.ZoneId::systemDefault, io = kotlinx.coroutines.Dispatchers.IO)
+            val diary = LocalDiaryRepository(context, memory, reviews, db.memory(), app.resound.platform.SystemZone, Dispatchers.IO, cards = { d -> db.skills().cards(d.toEpochDay()).first().map { it.card() } })
             val md = diary.markdown(date, date, false)
             assertTrue(md.indexOf("## 卡片") > md.indexOf("## 回顾")); assertTrue(md.contains("会议纪要 ·")); assertTrue(md.contains("- 报价")); assertTrue(md.contains("- [x] 发送")); assertTrue(md.contains("> 下一行"))
             val source = DailyMemorySource(context, memory, reviews, db.memory(), db.review(), db.skills())

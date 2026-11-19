@@ -1,6 +1,7 @@
 package app.resound.ui
 
 import androidx.compose.animation.animateColorAsState
+import app.resound.ui.theme.fade
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -66,7 +67,7 @@ internal fun ReportCopySheet(fullText: String, blocks: List<ReportCopyBlock>, on
             }
             if (blocks.isNotEmpty()) {
                 Row(Modifier.padding(horizontal = 22.dp, vertical = 16.dp).fillMaxWidth()
-                    .clip(CircleShape).background(c.separator.copy(alpha = 0.65f)).padding(4.dp).selectableGroup()) {
+                    .clip(CircleShape).background(c.separator.fade(0.65f)).padding(4.dp).selectableGroup()) {
                     CopyMode("按模块", !freeSelection, Modifier.weight(1f)) { freeSelection = false }
                     CopyMode("自由选字", freeSelection, Modifier.weight(1f)) { freeSelection = true }
                 }
@@ -97,7 +98,7 @@ internal fun ReportCopySheet(fullText: String, blocks: List<ReportCopyBlock>, on
             }
             val enabled = if (freeSelection) !value.selection.collapsed else selected.isNotEmpty()
             Column(Modifier.fillMaxWidth().background(c.card).testTag("report-copy-footer")) {
-                HorizontalDivider(color = c.separator.copy(alpha = 0.7f))
+                HorizontalDivider(color = c.separator.fade(0.7f))
                 Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 14.dp),
                     horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -142,7 +143,7 @@ private fun CopyTextAction(label: String, enabled: Boolean, onClick: () -> Unit)
 private fun CopyModuleCard(block: ReportCopyBlock, checked: Boolean, onChecked: (Boolean) -> Unit) {
     val c = Rs.colors
     val background by animateColorAsState(if (checked) c.accentSoft else c.card, tween(180), label = "copyCard")
-    val border by animateColorAsState(if (checked) c.accent.copy(alpha = 0.65f) else c.separator.copy(alpha = 0.6f), tween(180), label = "copyBorder")
+    val border by animateColorAsState(if (checked) c.selected.copy(alpha = 0.65f) else c.separator.fade(0.6f), tween(180), label = "copyBorder")
     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(background)
         .border(1.dp, border, RoundedCornerShape(18.dp))
         .toggleable(checked, role = Role.Checkbox, onValueChange = onChecked)
@@ -153,8 +154,8 @@ private fun CopyModuleCard(block: ReportCopyBlock, checked: Boolean, onChecked: 
             Box(Modifier.padding(start = 12.dp).size(22.dp), contentAlignment = Alignment.Center) {
                 androidx.compose.animation.AnimatedVisibility(checked, enter = fadeIn(tween(140)) + scaleIn(tween(180), initialScale = 0.8f), exit = fadeOut(tween(100))) {
                     Canvas(Modifier.size(22.dp).clip(CircleShape).background(c.accent).padding(6.dp)) {
-                        drawLine(Color.White, Offset(0f, size.height * 0.5f), Offset(size.width * 0.36f, size.height * 0.86f), 1.8.dp.toPx(), StrokeCap.Round)
-                        drawLine(Color.White, Offset(size.width * 0.36f, size.height * 0.86f), Offset(size.width, size.height * 0.13f), 1.8.dp.toPx(), StrokeCap.Round)
+                        drawLine(c.onAccent, Offset(0f, size.height * 0.5f), Offset(size.width * 0.36f, size.height * 0.86f), 1.8.dp.toPx(), StrokeCap.Round)
+                        drawLine(c.onAccent, Offset(size.width * 0.36f, size.height * 0.86f), Offset(size.width, size.height * 0.13f), 1.8.dp.toPx(), StrokeCap.Round)
                     }
                 }
             }

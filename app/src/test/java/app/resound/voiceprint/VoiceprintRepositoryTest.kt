@@ -34,7 +34,7 @@ class VoiceprintRepositoryTest {
     private fun vector(index: Int) = FloatArray(192).apply { this[index] = 1f }
     @Before fun setup() {
         context = RuntimeEnvironment.getApplication()
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         sampleStore = SampleAudioStore(java.nio.file.Files.createTempDirectory("sample-audio").toFile().also { files += it })
         repository = createRepository()
@@ -174,7 +174,7 @@ class VoiceprintRepositoryTest {
         enroll(); val (segment, _) = segment()
         val transcribe = TranscribeRunner(db.transcribe(), object : AsrProvider {
             override suspend fun recognize(audio: AsrAudio, key: String, beforeAudio: suspend () -> Unit): AsrResult = error("不应上传")
-        }, { "" }, { _, _ -> }, now = { clock }, deferAudioCleanup = true)
+        }, { "" }, { _, _ -> }, now = { clock })
         transcribe.run()
         assertTrue(File(segment.path).exists()) // App 的转写开始阶段不再提前删待比对录音。
         failDecode = true
@@ -388,7 +388,7 @@ class VoiceprintRepositoryTest {
         scope.coroutineContext[Job]!!.cancelAndJoin(); db.close()
         val file = File.createTempFile("voiceprint-db-", ".db", context.cacheDir).also { files += it }
         files += File("${file.path}.voiceprint-features")
-        db = Room.databaseBuilder(context, CaptureDatabase::class.java, file.path).allowMainThreadQueries().build()
+        db = CaptureDatabase.open(context, file.path)
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         repository = createRepository()
         enroll()
@@ -401,7 +401,7 @@ class VoiceprintRepositoryTest {
         repository.run()
         assertFalse(db.voiceprint().samples().any { it.segmentId == segment.id })
         scope.coroutineContext[Job]!!.cancelAndJoin(); db.close()
-        db = Room.databaseBuilder(context, CaptureDatabase::class.java, file.path).allowMainThreadQueries().build()
+        db = CaptureDatabase.open(context, file.path)
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         repository = LocalVoiceprintRepository(db, scope, { error("不得重新解码") }, { error("不得重新加载模型") },
             { scheduled.trySend(Unit); Unit }, { clock })

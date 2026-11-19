@@ -1,5 +1,6 @@
 package app.resound.ui.onboarding
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -7,7 +8,6 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -26,11 +26,11 @@ import app.resound.ui.verify.RsCard
 @Composable
 fun OnboardingTipCard(topGap: Dp = 0.dp) {
     if (!AppGraph.isOnboardingReady) return
-    val tips by AppGraph.onboarding.tips.collectAsState()
+    val tips by AppGraph.onboarding.tips.collectAsStateWithLifecycle()
     val tip = tips.firstOrNull() ?: return
     val c = Rs.colors
     val (icon, title, body, page) = when (tip) {
-        OnboardingTip.KeepAlive -> Quad("🔋", "涛声刚才被系统关掉过", "小米等手机还要打开“自启动”、把电池设为“无限制”，才能全天收音不断。", SettingsPage.Capture)
+        OnboardingTip.KeepAlive -> Quad("🔋", "涛声刚才被系统关掉过", app.resound.ui.today.keepAliveHint(androidx.compose.ui.platform.LocalContext.current), SettingsPage.Capture)
         OnboardingTip.Speakers -> Quad("👥", "最近常有几个人一起说话", "打开“区分说话人”，原话里会分清是谁说的，整理出的事也更准。", SettingsPage.Voiceprint)
         OnboardingTip.Backup -> Quad("☁️", "已经用了几天，设个备份吧", "换手机、误删都能找回来。可以存在手机文件夹，或坚果云、WebDAV、S3。", SettingsPage.Backup)
     }

@@ -1,5 +1,6 @@
 package app.resound.ui.today
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.widget.Toast
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
@@ -15,7 +16,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -42,7 +42,6 @@ import app.resound.ui.verify.formatClock
 import app.resound.ui.verify.springClick
 import kotlinx.coroutines.launch
 
-private val PAUSE_MINUTES = listOf(15, 30, 60, 120)
 private val FORGET_MINUTES = listOf(10, 30, 60)
 
 /** 点主卡上的“正在聆听”：暂停（选时长）/ 恢复 / 开始；删除最近一段（点两次才删） */
@@ -51,13 +50,14 @@ fun ListenSheet(capture: CaptureController, startOnForget: Boolean = false, onDi
     val c = Rs.colors
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val status by capture.status.collectAsState()
-    var pauseFor by remember { mutableIntStateOf(30) }
+    val status by capture.status.collectAsStateWithLifecycle()
+    var pauseFor by remember { mutableIntStateOf(if (AppGraph.isQuickPrefsReady) AppGraph.quickPrefs.lastPauseMinutes.value else 30) }
     var forgetFor by remember { mutableIntStateOf(10) }
     var confirm by remember { mutableStateOf(startOnForget) }
     var busy by remember { mutableStateOf(false) }
     val today = java.time.LocalDate.now()
     var rangeOn by remember { mutableStateOf(false) }
+    var allOn by remember { mutableStateOf(false) }
     var range by remember { mutableStateOf(app.resound.recordings.RecordingRange(today, today, java.time.LocalTime.of(0, 0), java.time.LocalTime.now().withSecond(0).withNano(0))) }
     val rangeValid = range.startMillis() <= range.endMillis()
     val preview by androidx.compose.runtime.produceState<app.resound.privacy.ForgetPreview?>(null, rangeOn, range) {
@@ -83,9 +83,9 @@ fun ListenSheet(capture: CaptureController, startOnForget: Boolean = false, onDi
             listening -> {
                 Label("暂停多久")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PAUSE_MINUTES.forEach { m -> Choice(if (m < 60) "$m 分钟" else "${m / 60} 小时", m == pauseFor, Modifier.weight(1f)) { pauseFor = m } }
+                    PAUSE_CHOICES.forEach { m -> Choice(if (m < 60) "$m 分钟" else "${m / 60} 小时", m == pauseFor, Modifier.weight(1f)) { pauseFor = m } }
                 }
-                ActionButton("暂停", ActionKind.Primary) { capture.pause(pauseFor); onDismiss() }
+                ActionButton("暂停", ActionKind.Primary) { capture.pause(pauseFor); rememberPauseMinutes(pauseFor); onDismiss() }
             }
             status.state == CaptureState.Paused -> ActionButton("现在恢复", ActionKind.Primary) { capture.resume(); onDismiss() }
             else -> ActionButton("开始聆听", ActionKind.Primary) { capture.start(); onDismiss() }
@@ -95,7 +95,7 @@ fun ListenSheet(capture: CaptureController, startOnForget: Boolean = false, onDi
         if (AppGraph.isTopicsReady) {
             Spacer(Modifier.height(10.dp))
             Box(Modifier.fillMaxWidth().padding(vertical = 2.dp).height(0.5.dp).background(c.separator))
-            app.resound.ui.topic.TopicSection(onDismiss)
+            app.resound.ui.topic.TopicSection(onDismiss, if (AppGraph.isQuickPrefsReady) AppGraph.quickPrefs.lastTopicKind.value else app.resound.topic.TopicKind.Meeting)
         }
 
         if (AppGraph.isPrivacyReady) {
@@ -103,8 +103,10 @@ fun ListenSheet(capture: CaptureController, startOnForget: Boolean = false, onDi
             Box(Modifier.fillMaxWidth().padding(vertical = 2.dp).height(0.5.dp).background(c.separator))
             Label("不想留的话：删掉哪段时间")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FORGET_MINUTES.forEach { m -> Choice(if (m < 60) "$m 分钟" else "${m / 60} 小时", !rangeOn && m == forgetFor, Modifier.weight(1f)) { forgetFor = m; rangeOn = false; confirm = false } }
-                Choice("自定义", rangeOn, Modifier.weight(1f)) { rangeOn = true; confirm = false }
+                FORGET_MINUTES.forEach { m -> Choice(if (m < 60) "$m 分钟" else "${m / 60} 小时", !rangeOn && !allOn && m == forgetFor, Modifier.weight(1f)) { forgetFor = m; rangeOn = false; allOn = false; confirm = false } }
+                Choice("自定义", rangeOn, Modifier.weight(1f)) { rangeOn = true; allOn = false; confirm = false }
+                if (AppGraph.privacy is app.resound.privacy.RoomPrivacyActions)
+                    Choice("全部", allOn, Modifier.weight(1f)) { allOn = true; rangeOn = false; confirm = false }
             }
             if (rangeOn) {
                 app.resound.ui.transcript.RangeEnd("从", range.from, range.fromTime, today.minusYears(1), today) { d, t -> range = range.copy(from = d, fromTime = t); confirm = false }
@@ -112,26 +114,35 @@ fun ListenSheet(capture: CaptureController, startOnForget: Boolean = false, onDi
                 Text(when {
                     !rangeValid -> "开始时间不能晚于结束时间"
                     preview == null -> "正在计算…"
-                    preview!!.segments == 0 -> "这段时间没有录音"
+                    preview!!.segments == 0 -> "没有时间线录音；仍会清理对应设备完整归档"
                     else -> "这段时间有 ${preview!!.segments} 段录音，共 ${app.resound.ui.verify.formatDuration(preview!!.audioMillis, seconds = false)}"
                 }, style = RsType.caption, color = if (rangeValid) c.textSecondary else c.warning)
             }
-            val what = if (rangeOn) "这段时间" else if (forgetFor < 60) "最近 $forgetFor 分钟" else "最近 ${forgetFor / 60} 小时"
+            val what = if (allOn) "全部本机录音" else if (rangeOn) "这段时间" else if (forgetFor < 60) "最近 $forgetFor 分钟" else "最近 ${forgetFor / 60} 小时"
+            Text("删除本机录音、原话、相关内容和设备完整归档，无法恢复。跨日期或时间不明的完整归档会整段删除。", style = RsType.caption, color = c.textTertiary)
+            Text("独立备份（云端或 USB 电脑）和录音豆里的原件不会随此操作删除。需要彻底清除时，请到原备份目的地及设备管理处另行处理。", style = RsType.caption, color = c.warning)
             ActionButton(
                 when { busy -> "正在删除…"; confirm -> "确定删除$what？再点一次"; else -> "删除$what" },
-                ActionKind.Danger, enabled = !busy && (!rangeOn || (rangeValid && (preview?.segments ?: 0) > 0)),
+                ActionKind.Danger, enabled = !busy && (!rangeOn || rangeValid),
             ) {
                 if (!confirm) { confirm = true; return@ActionButton }
                 busy = true
                 scope.launch {
-                    val r = runCatching { if (rangeOn) AppGraph.privacy.deleteRange(range.startMillis(), range.endMillis()) else AppGraph.privacy.deleteRecent(forgetFor) }
+                    val r = runCatching {
+                        when {
+                            allOn -> (AppGraph.privacy as app.resound.privacy.RoomPrivacyActions).deleteAll()
+                            rangeOn -> AppGraph.privacy.deleteRange(range.startMillis(), range.endMillis())
+                            else -> AppGraph.privacy.deleteRecent(forgetFor)
+                        }
+                    }
                     busy = false
-                    Toast.makeText(context, r.fold({ if (it.segments == 0) "${what}没有录音" else "已删除 ${it.segments} 段录音和相关记录" }, { "没删成功，请再试一次" }),
+                    Toast.makeText(context, r.fold({ "本机相关录音、记录和设备完整归档已清理" }, {
+                        if (it is app.resound.privacy.FileCleanupPending) "记录已删除，部分本机文件将自动重试清理" else "删除未完成，请查看问题记录或稍后重试"
+                    }),
                         Toast.LENGTH_SHORT).show()
                     if (r.isSuccess) onDismiss()
                 }
             }
-            Text("录音、原话和由它们整理出的内容一起彻底删除，无法恢复。", style = RsType.caption, color = c.textTertiary)
         }
     }
 }
@@ -144,8 +155,8 @@ private fun Label(text: String) {
 @Composable
 private fun Choice(text: String, on: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (on) c.accent else c.background, spring(stiffness = Spring.StiffnessMediumLow), label = "listenChoice")
-    val fg by animateColorAsState(if (on) Color.White else c.textSecondary, label = "listenChoiceFg")
+    val bg by animateColorAsState(if (on) c.selected else c.fill, spring(stiffness = Spring.StiffnessMediumLow), label = "listenChoice")
+    val fg by animateColorAsState(if (on) c.onSelected else c.textSecondary, label = "listenChoiceFg")
     Box(modifier.springClick(onClick).clip(CircleShape).background(bg).padding(vertical = 9.dp), contentAlignment = Alignment.Center) {
         Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = fg, maxLines = 1)
     }

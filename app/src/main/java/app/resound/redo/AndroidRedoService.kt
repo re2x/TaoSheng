@@ -1,9 +1,17 @@
 package app.resound.redo
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.digest.LlmException
+import app.resound.transcribe.AsrException
+
+import app.resound.scheduling.BackgroundRefreshPolicy
+import app.resound.scheduling.refreshWhileNeeded
 import android.content.Context
 import androidx.work.*
 import app.resound.data.CaptureDatabase
 import app.resound.transcribe.TranscribeSource
+import app.resound.transcribe.calendarChanges
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
@@ -35,25 +43,38 @@ internal class AndroidRedoService(
     init {
         if (jobs.value.any { it.state is RedoJobState.Running }) enqueue()
         scope.launch {
-            while (isActive) {
-                delay(1000); mutableOptions.value = options()
-                gate.withLock {
-                    val snapshot = db.redoData().snapshotMeta()
-                    if (snapshot != null && snapshot.at < now() - 86_400_000) db.redoData().clear()
-                    synchronized(this@AndroidRedoService) {
-                        val undoId = snapshot?.takeIf { it.at >= now() - 86_400_000 }?.jobId
-                        val fresh = jobs.value.filter { it.state is RedoJobState.Running || it.createdAt >= now() - 86_400_000 }.map {
-                            val state = it.state
-                            if (state is RedoJobState.Done) it.copy(state = state.copy(undoable = it.id == undoId)) else it
+            mutableOptions.subscriptionCount.map { it > 0 }.refreshWhileNeeded(1000) { mutableOptions.value = options() }
+        }
+        scope.launch {
+            combine(jobs, calendarChanges(context)) { rows, _ -> rows }.collectLatest {
+                while (isActive) {
+                    var nextExpiry: Long? = null
+                    gate.withLock {
+                        val snapshot = db.redoData().snapshotMeta()
+                        if (snapshot != null && snapshot.at < now() - 86_400_000) db.redoData().clear()
+                        else nextExpiry = snapshot?.at?.let(BackgroundRefreshPolicy::redoDeadline)
+                        synchronized(this@AndroidRedoService) {
+                            val undoId = snapshot?.takeIf { it.at >= now() - 86_400_000 }?.jobId
+                            val fresh = jobs.value.filter { it.state is RedoJobState.Running || it.createdAt >= now() - 86_400_000 }.map {
+                                val state = it.state
+                                if (state is RedoJobState.Done) it.copy(state = state.copy(undoable = it.id == undoId)) else it
+                            }
+                            if (fresh != jobs.value) publish(fresh)
+                            nextExpiry = (fresh.filter { it.state !is RedoJobState.Running }.map { BackgroundRefreshPolicy.redoDeadline(it.createdAt) } + listOfNotNull(nextExpiry)).minOrNull()
                         }
-                        if (fresh != jobs.value) publish(fresh)
                     }
+                    val deadline = nextExpiry ?: break
+                    delay((deadline - now()).coerceAtLeast(1))
                 }
             }
         }
     }
-    override suspend fun estimate(request: RedoRequest) = engine.estimate(request)
+    override suspend fun estimate(request: RedoRequest): RedoEstimate {
+        (asr as? AndroidAsrChooser)?.refresh()
+        return engine.estimate(request)
+    }
     @Synchronized override fun start(request: RedoRequest): String {
+        (asr as? AndroidAsrChooser)?.refresh()
         val normalized = request.copy(eventIds = request.eventIds.distinct(), segmentIds = request.segmentIds.distinct(),
             asr = request.asr ?: asr.lastChoice.value,
             llmPresetId = request.llmPresetId ?: choices.getString("llm", null)?.takeIf { id -> options().any { it.presetId == id && it.ready } } ?: currentLlm())
@@ -65,7 +86,9 @@ internal class AndroidRedoService(
             else -> "重做事件"
         }, normalized,
             RedoJobState.Running("排队中", 0f), now()))
-        try { enqueue() } catch (_: Exception) { update(id, RedoJobState.Failed("无法安排后台重做，请重试")) }
+        try { enqueue() } catch (caught: Exception) {
+            FailureNotes.record("redo/AndroidRedoService.kt:87", caught)
+            update(id, RedoJobState.Failed("无法安排后台重做，请重试")) }
         return id
     }
     @Synchronized override fun cancel(id: String) {
@@ -100,6 +123,8 @@ internal class AndroidRedoService(
                         idle {
                             fun checkpoint() { if (job(next.id)?.state !is RedoJobState.Running) throw CancellationException("已取消") }
                             checkpoint()
+                            // 无界面订阅时仍以执行当下的配置/下载状态校验后台任务。
+                            (asr as? AndroidAsrChooser)?.refresh()
                             if (next.request.scope.transcribes) require(asr.options.value.any { it.source == next.request.asr && it.ready }) { "指定转写方式未就绪" }
                             if (next.request.scope.digests) require(options().any { it.presetId == next.request.llmPresetId && it.ready }) { "指定整理模型未就绪" }
                             engine.run(next.id, next.request, ::checkpoint) { stage, fraction ->
@@ -118,8 +143,8 @@ internal class AndroidRedoService(
                         }
                     } catch (e: CancellationException) { throw e }
                     catch (e: Exception) { update(next.id, RedoJobState.Failed(when (e) {
-                        is app.resound.digest.LlmException -> e.type.human
-                        is app.resound.transcribe.AsrException -> e.type.human
+                        is LlmException -> e.type.human
+                        is AsrException -> e.type.human
                         is IllegalArgumentException, is IllegalStateException -> e.message ?: "重做失败，请重试"
                         else -> "重做失败，请重试"
                     })) }
@@ -152,7 +177,9 @@ internal class AndroidRedoService(
         mutableJobs.value = value
     }
     private fun load(): List<RedoJob> {
-        val json = runCatching { JSONArray(prefs.getString("jobs", "[]")) }.getOrDefault(JSONArray())
+        val json = runCatching { JSONArray(prefs.getString("jobs", "[]")) }.onFailure {
+            FailureNotes.record("redo/AndroidRedoService.kt:176", it)
+        }.getOrDefault(JSONArray())
         return (0 until json.length()).mapNotNull { i -> runCatching {
             val j = json.getJSONObject(i)
             fun ids(key: String) = j.getJSONArray(key).let { a -> (0 until a.length()).map { a.getLong(it) } }
@@ -166,6 +193,8 @@ internal class AndroidRedoService(
                 else -> RedoJobState.Running("等待恢复", 0f)
             }
             RedoJob(j.getString("id"), j.getString("title"), request, state, j.getLong("at"))
+        }.onFailure {
+            FailureNotes.record("redo/AndroidRedoService.kt:177", it)
         }.getOrNull() }
     }
     companion object {

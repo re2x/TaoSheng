@@ -31,6 +31,16 @@ internal class AndroidUpdatePlatform(
         if (!it.isSealed) { manager.packageInstaller.abandonSession(id); false } else true
     } ?: false
 
+    override fun endSession(id: Int) {
+        runCatching { manager.packageInstaller.abandonSession(id) }
+            .onFailure { UpdateDiagnostics.record(context, "install session=$id abandon=${it.javaClass.simpleName}") }
+        UpdateNotifications.dismissConfirmation(context)
+    }
+    override fun installedVersionCode() = manager.getPackageInfo(context.packageName, 0).longVersionCode
+    override suspend fun afterCommit(session: Int) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+        InstallRelay.openFromForeground(session)
+    }
+
     override fun install(apk: File, rememberSession: (Int) -> Unit) {
         val installer = manager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
@@ -52,7 +62,9 @@ internal class AndroidUpdatePlatform(
                 val pending = PendingIntent.getBroadcast(context, id, intent, flags)
                 session.commit(pending.intentSender)
             }
-        } catch (e: Exception) { runCatching { installer.abandonSession(id) }; throw e }
+        } catch (e: Exception) { runCatching {
+            // 仅释放/清除临时资源；失败不改变已确定的业务结果，可忽略。
+             installer.abandonSession(id) }; throw e }
     }
     override fun notifyAvailable(info: UpdateInfo) = UpdateNotifications.available(context, info)
     override fun dismissNotification() = UpdateNotifications.dismiss(context)

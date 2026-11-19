@@ -1,5 +1,8 @@
 package app.resound.ui.items
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.datetime.toJavaLocalDate
+import kotlinx.datetime.toKotlinLocalDate
 import app.resound.ui.ScrollTopButton
 import app.resound.ui.things.AddThingHost
 import app.resound.ui.things.thingsTab
@@ -35,7 +38,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -120,9 +122,9 @@ fun TodoScreen(memory: MemoryRepository, bottomPadding: Dp) {
     val today = remember { LocalDate.now() }
     // 已完成默认看 7 天，“查看更早”每次再往前一个月
     var doneDays by rememberSaveable { mutableStateOf(7) }
-    val pendingItems by remember { memory.items(TASKS, setOf(ItemStatus.Pending)) }.collectAsState(initial = null)
-    val ongoingItems by remember { memory.ongoing() }.collectAsState(initial = null)
-    val doneItems by remember(doneDays) { memory.doneItems(today.minusDays(doneDays - 1L)) }.collectAsState(initial = null)
+    val pendingItems by remember { memory.items(TASKS, setOf(ItemStatus.Pending)) }.collectAsStateWithLifecycle(initialValue = null)
+    val ongoingItems by remember { memory.ongoing() }.collectAsStateWithLifecycle(initialValue = null)
+    val doneItems by remember(doneDays) { memory.doneItems(today.minusDays(doneDays - 1L).toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = null)
     // 进入页面时停在第一个有内容的栏（待确认 → 进行中 → 已完成），都没有就停在进行中；之后不再自动跳
     var decided by rememberSaveable { mutableStateOf(false) }
     var tabIndex by rememberSaveable { mutableStateOf(1) }
@@ -157,13 +159,83 @@ fun TodoScreen(memory: MemoryRepository, bottomPadding: Dp) {
             prefs.edit().putLong("strongSetupShown", today).apply(); setupSheet = true
         }
     }
+    // ---------- 日历视图（进行中）：周条 + 连续日程 ----------
+    val agendaZone = remember { kotlinx.datetime.TimeZone.currentSystemDefault() }
+    val agendaNow = remember(ongoingItems, pendingItems) { System.currentTimeMillis() }
+    val agenda = remember(ongoingItems, pendingItems, agendaNow) {
+        app.resound.todo.TodoAgendaRules.build(ongoingItems.orEmpty(), pendingItems.orEmpty(), agendaNow, agendaZone) }
+    val marks = remember(ongoingItems, pendingItems, agendaNow) {
+        app.resound.todo.TodoAgendaRules.marks(ongoingItems.orEmpty(), pendingItems.orEmpty(), agendaNow, agendaZone) }
+    var selectedEpoch by rememberSaveable { mutableLongStateOf(today.toEpochDay()) }
+    val selectedDay = LocalDate.ofEpochDay(selectedEpoch)
+    var overdueOpen by rememberSaveable { mutableStateOf(false) }
+    var laterOpen by remember { mutableStateOf(setOf<String>()) }
+    val pastDone by remember(selectedEpoch) {
+        if (selectedDay < today) memory.doneItems(selectedDay.toKotlinLocalDate()) else flowOf(emptyList())
+    }.collectAsStateWithLifecycle(initialValue = null)
+    val pastDoneOnDay = pastDone?.filter { it.doneAt?.let(::dateOf) == selectedDay }
+    val agendaContext = androidx.compose.ui.platform.LocalContext.current
+    val ongoingState = listStates[TodoTab.Ongoing.ordinal]
+    // 与 LazyColumn 里的顺序一致，用来“点哪天滑到哪天”和“滑到哪天周条跟着亮”
+    val agendaKeys = buildList {
+        add("ongoingHead"); add("strip")
+        if (ongoingItems != null && ongoingItems!!.isEmpty() && agenda.days.all { it.empty }) add("ongoingEmpty")
+        if (agenda.overdue.isNotEmpty()) { add("overdue"); if (overdueOpen) add("overdueList") }
+        if (selectedDay < today) add("past-$selectedDay")
+        agenda.days.forEach { add("day-${it.date.java()}") }
+        agenda.later.forEach { add("later-${it.key}") }
+    }
+    val keysNow by androidx.compose.runtime.rememberUpdatedState(agendaKeys)
+    LaunchedEffect(ongoingState) {
+        androidx.compose.runtime.snapshotFlow { ongoingState.firstVisibleItemIndex to ongoingState.isScrollInProgress }.collect { (i, moving) ->
+            if (!moving) return@collect
+            keysNow.getOrNull(i + 1)?.takeIf { it.startsWith("day-") }?.let { selectedEpoch = LocalDate.parse(it.removePrefix("day-")).toEpochDay() }
+        }
+    }
+    fun pickDay(d: LocalDate) {
+        selectedEpoch = d.toEpochDay()
+        val window = d >= today && d < today.plusDays(app.resound.todo.TodoAgendaRules.WINDOW_DAYS.toLong())
+        val key = when {
+            d < today -> "past-$d"
+            window -> "day-$d"
+            else -> app.resound.todo.TodoAgendaRules.laterKey(d.toKotlinLocalDate(), today.toKotlinLocalDate()).also { laterOpen = laterOpen + it }.let { "later-$it" }
+        }
+        scope.launch {
+            kotlinx.coroutines.delay(60)
+            val idx = keysNow.indexOf(key)
+            if (idx >= 0) ongoingState.animateScrollToItem(idx) else if (d < today) ongoingState.animateScrollToItem(0)
+        }
+    }
+    fun addFor(d: LocalDate) {
+        agendaContext.startActivity(android.content.Intent(agendaContext, QuickTodoActivity::class.java).putExtra(QuickTodoActivity.DAY, d.toEpochDay()))
+    }
+    fun moveToToday(items: List<MemoryItem>) {
+        val now = System.currentTimeMillis()
+        items.forEach { val (at, timed) = app.resound.todo.TodoAgendaRules.moveToToday(it, now, agendaZone); memory.updateItem(it.id, it.content, at, timed, it.who) }
+        overdueOpen = false
+        android.widget.Toast.makeText(agendaContext, "已把 ${items.size} 件改到今天", android.widget.Toast.LENGTH_SHORT).show()
+    }
+    val agendaRow: @Composable (MemoryItem) -> Unit = { item ->
+        swipe.wrap(item) { ItemRow(item, checkable = true, onToggle = { toggle(item) }, onBell = { bell(item, it) }) { opened = item } }
+    }
+    val pendingRow: @Composable (MemoryItem) -> Unit = { item ->
+        PendingAgendaRow(item, { memory.setItemStatus(item.id, ItemStatus.Accepted) }, { memory.setItemStatus(item.id, ItemStatus.Ignored) }) { opened = item }
+    }
     val counts = listOf(pendingItems?.size, ongoingItems?.size, null)
+    val recordSearch = app.resound.ui.today.rememberRecordSearch()
+    var searching by remember { mutableStateOf(false) }
+    if (searching && recordSearch != null)
+        app.resound.ui.today.RecordSearchSheet(recordSearch, app.resound.search.SearchKind.Todo) { searching = false }
 
     Box(Modifier.fillMaxSize()) {
         app.resound.ui.ScrollToTopOnReselect(listStates[pager.currentPage])
         Column(Modifier.fillMaxSize().background(c.background).windowInsetsPadding(WindowInsets.safeDrawing)) {
             Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp)) {
-                PageTitle("待办"); Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PageTitle("待办", Modifier.weight(1f))
+                    recordSearch?.let { app.resound.ui.today.SearchButton { searching = true } }
+                }
+                Spacer(Modifier.height(12.dp))
                 // 胶囊带数字：不点进去也知道哪栏有东西；点胶囊翻过去
                 Capsules(TodoTab.entries.mapIndexed { i, t -> counts[i]?.takeIf { it > 0 }?.let { "${t.title} $it" } ?: t.title }, pager.currentPage) {
                     scope.launch { pager.animateScrollToPage(it) }
@@ -186,7 +258,7 @@ fun TodoScreen(memory: MemoryRepository, bottomPadding: Dp) {
                 }
                 LazyColumn(Modifier.fillMaxSize(), state = listState,
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = bottomPadding + 100.dp)) {
-                    if (list != null && list.isEmpty() && tab != TodoTab.Done) item { Empty(emptyText(tab.title)) }
+                    if (list != null && list.isEmpty() && tab == TodoTab.Pending) item { Empty(emptyText(tab.title)) }
                     when (tab) {
                         TodoTab.Pending -> {
                             val cutoff = System.currentTimeMillis() - 3 * 86_400_000L
@@ -208,26 +280,71 @@ fun TodoScreen(memory: MemoryRepository, bottomPadding: Dp) {
                                 item(key = "older") {
                                     Row(Modifier.fillMaxWidth().springClick { olderOpen = !olderOpen }.padding(start = 4.dp, top = 4.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Text("更早没确认的 · ${older.size} 条", style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.textSecondary, modifier = Modifier.weight(1f))
-                                        Text(if (olderOpen) "收起" else "展开", style = RsType.caption, color = c.accent)
+                                        Text(if (olderOpen) "收起 ⌃" else "展开 ⌄", style = RsType.caption.copy(fontWeight = FontWeight.SemiBold), color = c.accent)
                                     }
                                 }
                                 if (olderOpen) groupedItems(older, Grouping.Mentioned, checkable = false, keyPrefix = "o", swipe = swipe, onToggle = toggle, onBell = bell) { opened = it }
                             }
                         }
                         TodoTab.Ongoing -> {
-                            val timed = list.orEmpty().filter { it.dueAt != null }.sortedBy { it.dueAt }
                             item(key = "ongoingHead") {
                                 Row(Modifier.padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Text(if (timed.isEmpty()) "随时做的" else "有时间的 · ${timed.size}", style = RsType.section, color = c.textSecondary,
-                                        modifier = Modifier.weight(1f).padding(start = 4.dp))
+                                    Text("按日子看", style = RsType.section, color = c.textSecondary, modifier = Modifier.weight(1f).padding(start = 4.dp))
                                     Pill("提醒", filled = false) { reminders = true }
                                 }
                             }
-                            if (timed.isNotEmpty()) {
-                                groupedItems(timed, Grouping.Due, checkable = true, keyPrefix = "t", swipe = swipe, onToggle = toggle, onBell = bell) { opened = it }
-                                if (order.isNotEmpty()) item(key = "freeHead") {
-                                    Text("随时做的 · ${order.size}", style = RsType.section, color = c.textSecondary, modifier = Modifier.padding(start = 4.dp, top = 6.dp, bottom = 10.dp))
+                            item(key = "strip") {
+                                Column {
+                                    TodoCalendarStrip(selectedDay, marks) { pickDay(it) }
+                                    Spacer(Modifier.height(14.dp))
                                 }
+                            }
+                            if (list != null && list.isEmpty() && agenda.days.all { it.empty }) item(key = "ongoingEmpty") { Empty(emptyText(tab.title)) }
+                            if (agenda.overdue.isNotEmpty()) {
+                                item(key = "overdue") {
+                                    Column {
+                                        OverdueCard(agenda.overdue, overdueOpen, { overdueOpen = !overdueOpen }) { moveToToday(agenda.overdue) }
+                                        Spacer(Modifier.height(if (overdueOpen) 8.dp else 14.dp))
+                                    }
+                                }
+                                if (overdueOpen) item(key = "overdueList") {
+                                    Column { AgendaCard(agenda.overdue, emptyList(), agendaRow, {}); Spacer(Modifier.height(14.dp)) }
+                                }
+                            }
+                            if (selectedDay < today) item(key = "past-$selectedDay") {
+                                Column {
+                                    AgendaDayHeader(selectedDay, "回看")
+                                    val done = pastDoneOnDay.orEmpty()
+                                    if (done.isEmpty()) Text("那天没有完成的事", style = RsType.subhead, color = c.textTertiary, modifier = Modifier.padding(start = 4.dp, bottom = 6.dp))
+                                    else AgendaCard(done, emptyList(), agendaRow, {})
+                                    Spacer(Modifier.height(14.dp))
+                                }
+                            }
+                            agenda.days.forEach { day ->
+                                val d = day.date.java()
+                                item(key = "day-$d") {
+                                    Column(Modifier.animateItem()) {
+                                        if (day.empty) EmptyDayRow(d) { addFor(d) }
+                                        else {
+                                            AgendaDayHeader(d, "${day.items.size + day.pending.size} 件")
+                                            AgendaCard(day.items, day.pending, agendaRow, pendingRow)
+                                        }
+                                        Spacer(Modifier.height(if (day.empty) 4.dp else 14.dp))
+                                    }
+                                }
+                            }
+                            agenda.later.forEach { g ->
+                                item(key = "later-${g.key}") {
+                                    Column(Modifier.padding(top = 6.dp)) {
+                                        val open = g.key in laterOpen
+                                        LaterHeader(g, open) { laterOpen = if (open) laterOpen - g.key else laterOpen + g.key }
+                                        if (open) { Spacer(Modifier.height(8.dp)); AgendaCard(g.items, g.pending, agendaRow, pendingRow) }
+                                        Spacer(Modifier.height(10.dp))
+                                    }
+                                }
+                            }
+                            if (order.isNotEmpty()) item(key = "freeHead") {
+                                Text("随时做 · 没定日子 · ${order.size}", style = RsType.section, color = c.textSecondary, modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 10.dp))
                             }
                             if (order.size > 1) item(key = "dragHint") { Hint("长按拖动，调整先后") }
                             items(order, key = { it.id }) { item ->
@@ -306,6 +423,10 @@ fun MemoryScreen(
     var openedEvent by remember { mutableStateOf<MemoryEvent?>(null) }
     var openedReview by remember { mutableStateOf<DailyReview?>(null) }
     var exporting by remember { mutableStateOf(false) }
+    val recordSearch = app.resound.ui.today.rememberRecordSearch()
+    var searching by remember { mutableStateOf(false) }
+    if (searching && recordSearch != null)
+        app.resound.ui.today.RecordSearchSheet(recordSearch, app.resound.search.SearchKind.Memory) { searching = false }
     var linesOpen by remember(epochDay) { mutableStateOf(false) }
     // 时间线顺序：记住上次的选择
     val uiPrefs = androidx.compose.ui.platform.LocalContext.current.getSharedPreferences("ui", android.content.Context.MODE_PRIVATE)
@@ -316,25 +437,25 @@ fun MemoryScreen(
     LaunchedEffect(epochDay) { if (listState.firstVisibleItemIndex > 1) listState.scrollToItem(0) }
 
     // 按天要的数据
-    val review by remember(date, reviews) { reviews?.daily(date) ?: flowOf(null) }.collectAsState(initial = null)
-    val events by remember(date) { memory.events(date) }.collectAsState(initial = null)
-    val day by remember(date) { memory.dayItems(date) }.collectAsState(initial = null)
-    val segments by remember(date, transcripts) { transcripts?.day(date) ?: flowOf(emptyList()) }.collectAsState(initial = emptyList())
+    val review by remember(date, reviews) { reviews?.daily(date.toKotlinLocalDate()) ?: flowOf(null) }.collectAsStateWithLifecycle(initialValue = null)
+    val events by remember(date) { memory.events(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = null)
+    val day by remember(date) { memory.dayItems(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = null)
+    val segments by remember(date, transcripts) { transcripts?.day(date.toKotlinLocalDate()) ?: flowOf(emptyList()) }.collectAsStateWithLifecycle(initialValue = emptyList())
     val lines = remember(segments) { dayLines(segments) }
     val skills = remember { app.resound.ui.skills.skillRepo() }
-    val dayCards by remember(date) { skills.cards(date) }.collectAsState(initial = emptyList())
+    val dayCards by remember(date) { skills.cards(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = emptyList())
     var openedCard by remember { mutableStateOf<app.resound.skills.SkillCard?>(null) }
     var makingCard by remember { mutableStateOf(false) }
     var deletingEvent by remember { mutableStateOf<app.resound.digest.MemoryEvent?>(null) }
     val deleteNow = app.resound.ui.today.rememberDeleteEvent(memory)
-    val cardSkillIds by remember { skills.skillsWithCards }.collectAsState(initial = emptyList())
-    val skillNames = skills.skills.collectAsState().value.associate { it.id to it.name }
+    val cardSkillIds by remember { skills.skillsWithCards }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val skillNames = skills.skills.collectAsStateWithLifecycle().value.associate { it.id to it.name }
     var chipIndex by rememberSaveable { mutableStateOf(0) }
-    val starred by remember { memory.starredEvents() }.collectAsState(initial = null)
+    val starred by remember { memory.starredEvents() }.collectAsStateWithLifecycle(initialValue = null)
     // “卡片”分类的第二排小胶囊：回顾 + 出过卡的技能（按最近出卡排序）
     val chips = (if (reviews != null) listOf("review") else emptyList()) + cardSkillIds.filter { it != "review" }
     val chip = chips.getOrNull(chipIndex.coerceIn(0, (chips.size - 1).coerceAtLeast(0)))
-    val history by remember(chip) { if (chip == null || chip == "review") flowOf(emptyList()) else skills.cardsOf(chip) }.collectAsState(initial = emptyList())
+    val history by remember(chip) { if (chip == null || chip == "review") flowOf(emptyList()) else skills.cardsOf(chip) }.collectAsStateWithLifecycle(initialValue = emptyList())
     val hourSlots = remember(events, newestFirst) {
         val sorted = if (newestFirst) events.orEmpty().sortedByDescending { it.startAt } else events.orEmpty().sortedBy { it.startAt }
         sorted.groupBy { eventHourOf(it.startAt) }.map { (h, list) ->
@@ -344,26 +465,26 @@ fun MemoryScreen(
     // 跨了至少 3 个小时才有跳转的意义；全挤在一两个小时里只会显示孤零零一个数字
     val showIndex = byDay && events.orEmpty().size >= 6 && hourSlots.size >= 3
     // 按类要的数据
-    val items by remember(tab) { tab.source(memory) }.collectAsState(initial = null)
-    val reviewList by remember(reviews) { reviews?.recent() ?: flowOf(emptyList()) }.collectAsState(initial = emptyList())
-    val reviewState = reviews?.state?.collectAsState()?.value
+    val items by remember(tab) { tab.source(memory) }.collectAsStateWithLifecycle(initialValue = null)
+    val reviewList by remember(reviews) { reviews?.recent() ?: flowOf(emptyList()) }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val reviewState = reviews?.state?.collectAsStateWithLifecycle()?.value
     // 寻物（卡 079）
     val things = remember { app.resound.ui.things.thingRepo() }
     val onThings = !byDay && tab.name == "寻物"
     var thingQuery by rememberSaveable { mutableStateOf("") }
     var thingFilter by rememberSaveable { mutableStateOf(app.resound.ui.things.ThingFilter.All) }
     val thingList by app.resound.ui.things.rememberThingList(things, thingQuery)
-    val thingPending by remember { things.pending() }.collectAsState(initial = emptyList())
+    val thingPending by remember { things.pending() }.collectAsStateWithLifecycle(initialValue = emptyList())
     var openedThing by remember { mutableStateOf<Long?>(null) }
     var thingPendingOpen by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
     // 按天页的时间线筛选，换一天回到全部
     var dayFilter by remember(date) { mutableStateOf<app.resound.ui.today.TimelineFilter>(app.resound.ui.today.TimelineFilter.All) }
     // 卡 058：这天回顾的进度、原因和窗口；“生成回顾”是否出现与后端判断一致
-    val hasMaterial by remember(date, reviews) { reviews?.hasMaterial(date) ?: flowOf(false) }.collectAsState(initial = true)
-    val reviewWindow = remember(date, reviews, reviewState?.dailyAtMinutes) { reviews?.windowText(date).orEmpty() }
+    val hasMaterial by remember(date, reviews) { reviews?.hasMaterial(date.toKotlinLocalDate()) ?: flowOf(false) }.collectAsStateWithLifecycle(initialValue = true)
+    val reviewWindow = remember(date, reviews, reviewState?.dailyAtMinutes) { reviews?.windowText(date.toKotlinLocalDate()).orEmpty() }
     val reviewInfo = reviews?.let {
-        val note = reviewState?.lastError?.takeIf { reviewState.lastErrorDate == date }
+        val note = reviewState?.lastError?.takeIf { reviewState.lastErrorDate == date.toKotlinLocalDate() }
         app.resound.ui.items.ReviewInfo(reviewState?.stage, note, soft = note?.startsWith("已用现有内容生成") == true, hasMaterial = hasMaterial, window = reviewWindow)
     }
 
@@ -371,7 +492,7 @@ fun MemoryScreen(
     LaunchedEffect(openReview) { openReview?.let { byDay = true; epochDay = it.toEpochDay() } }
     LaunchedEffect(openReview, review) {
         if (openReview != null && !showReview) { onReviewShown(); return@LaunchedEffect }
-        if (openReview != null && review?.date == openReview) { openedReview = review; onReviewShown() }
+        if (openReview != null && review?.date?.toJavaLocalDate() == openReview) { openedReview = review; onReviewShown() }
     }
 
     app.resound.ui.ScrollToTopOnReselect(listState)
@@ -389,6 +510,7 @@ fun MemoryScreen(
         item(key = "title") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 PageTitle("记忆", Modifier.weight(1f))
+                recordSearch?.let { app.resound.ui.today.SearchButton { searching = true }; Spacer(Modifier.width(8.dp)) }
                 if (byDay && diary != null) {
                     Text("导出", style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.accent,
                         modifier = Modifier.springClick { exporting = true }.clip(CircleShape).background(c.accentSoft)
@@ -407,7 +529,7 @@ fun MemoryScreen(
                 onOpenEvent = { openedEvent = it },
                 onOpenItem = { opened = it },
                 onToggleDone = { memory.setItemStatus(it.id, if (it.status == ItemStatus.Done) ItemStatus.Accepted else ItemStatus.Done) },
-                onGenerate = reviews?.let { r -> { r.generateNow(date) } },
+                onGenerate = reviews?.let { r -> { r.generateNow(date.toKotlinLocalDate()) } },
                 generating = reviewState?.generating == true,
                 reviewInfo = reviewInfo,
                 newestFirst = newestFirst,
@@ -477,7 +599,7 @@ fun MemoryScreen(
                         history.groupBy { it.date }.forEach { (d, list) ->
                             item(key = "h$chip$d") {
                                 Column(Modifier.padding(bottom = 16.dp)) {
-                                    Text(dayLabel(d), style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.textTertiary,
+                                    Text(dayLabel(d.toJavaLocalDate()), style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.textTertiary,
                                         modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
                                     RsCard(padding = PaddingValues(vertical = 2.dp)) {
                                         list.forEachIndexed { i, card ->
@@ -598,8 +720,8 @@ private fun Capsules(names: List<String>, selected: Int, onSelect: (Int) -> Unit
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         names.forEachIndexed { i, n ->
             val on = i == selected
-            val bg by animateColorAsState(if (on) c.accent else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "cap")
-            val fg by animateColorAsState(if (on) Color.White else c.textSecondary, label = "capFg")
+            val bg by animateColorAsState(if (on) c.selected else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "cap")
+            val fg by animateColorAsState(if (on) c.onSelected else c.textSecondary, label = "capFg")
             Text(n, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = fg,
                 modifier = Modifier.springClick { onSelect(i) }.clip(CircleShape).background(bg).padding(horizontal = 16.dp, vertical = 8.dp))
         }

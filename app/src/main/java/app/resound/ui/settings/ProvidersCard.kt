@@ -1,5 +1,6 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,7 +25,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,21 +60,21 @@ private const val WORKSPACE = "{WorkspaceId}"
 @Composable
 fun ProvidersCard(providers: LlmProviders) {
     val c = Rs.colors
-    val saved by providers.saved.collectAsState()
-    val active by providers.activeId.collectAsState()
+    val saved by providers.saved.collectAsStateWithLifecycle()
+    val active by providers.activeId.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<SavedProvider?>(null) }
     var adding by remember { mutableStateOf(false) }
     val checker = if (app.resound.AppGraph.isLlmBalanceReady) app.resound.AppGraph.llmBalance else null
-    val balance = checker?.state?.collectAsState()?.value
-    val threshold = checker?.threshold?.collectAsState()?.value ?: 0.0
+    val balance = checker?.state?.collectAsStateWithLifecycle()?.value
+    val threshold = checker?.threshold?.collectAsStateWithLifecycle()?.value ?: 0.0
     var editingLine by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     var checking by remember { mutableStateOf(false) }
     var checkResult by remember(active) { mutableStateOf<Result<List<app.resound.digest.ModelCheckItem>>?>(null) }
     androidx.compose.runtime.LaunchedEffect(active, saved) { checker?.refresh() }
     val failover = if (app.resound.AppGraph.isLlmFailoverReady) app.resound.AppGraph.llmFailover else null
-    val failoverOn = failover?.enabled?.collectAsState()?.value == true
-    val lastSwitch = failover?.latestSwitch?.collectAsState()?.value
+    val failoverOn = failover?.enabled?.collectAsStateWithLifecycle()?.value == true
+    val lastSwitch = failover?.latestSwitch?.collectAsStateWithLifecycle()?.value
     // 与切换层一致：当前之外、可用的服务商按列表顺序当备用，每次最多再试两个。
     val backups = saved.filter { it.id != active && it.hasKey }.map { it.id }
     RsCard(Modifier.animateContentSize(), padding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)) {
@@ -87,7 +87,7 @@ fun ProvidersCard(providers: LlmProviders) {
             Row(Modifier.fillMaxWidth().springClick { if (!on) providers.activate(p.id) }.padding(vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(20.dp).clip(CircleShape).then(if (on) Modifier.background(c.accent) else Modifier.border(1.5.dp, c.separator, CircleShape)),
                     contentAlignment = Alignment.Center) {
-                    if (on) Box(Modifier.size(8.dp).clip(CircleShape).background(Color.White))
+                    if (on) Box(Modifier.size(8.dp).clip(CircleShape).background(c.onAccent))
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
@@ -191,7 +191,7 @@ private fun AddProviderSheet(providers: LlmProviders, onPicked: (ProviderTemplat
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             providers.templates.forEach { t ->
                 Text(t.name, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.text,
-                    modifier = Modifier.clip(CircleShape).background(c.background).springClick { onPicked(t) }.padding(horizontal = 14.dp, vertical = 9.dp))
+                    modifier = Modifier.clip(CircleShape).background(c.fill).springClick { onPicked(t) }.padding(horizontal = 14.dp, vertical = 9.dp))
             }
             Text("自己填写", style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = c.accent,
                 modifier = Modifier.clip(CircleShape).background(c.accentSoft).springClick { onPicked(null) }.padding(horizontal = 14.dp, vertical = 9.dp))
@@ -244,7 +244,7 @@ private fun ProviderSheet(providers: LlmProviders, p: SavedProvider, isNew: Bool
             val canFetch = url.isNotBlank() && (!needsWorkspace || workspace.isNotBlank()) && (p.hasKey || key.isNotBlank() || custom || headerAuth) && !fetching
             Text(if (fetching) "拉取中…" else "拉取模型", style = RsType.caption.copy(fontWeight = FontWeight.Medium),
                 color = if (canFetch) c.accent else c.textTertiary,
-                modifier = Modifier.clip(CircleShape).background(if (canFetch) c.accentSoft else c.background).springClick {
+                modifier = Modifier.clip(CircleShape).background(if (canFetch) c.accentSoft else c.fill).springClick {
                     if (!canFetch) return@springClick
                     fetching = true
                     scope.launch { fetched = providers.models(p.id.ifBlank { null }, url, keyArg); fetching = false }
@@ -253,18 +253,18 @@ private fun ProviderSheet(providers: LlmProviders, p: SavedProvider, isNew: Bool
         if (template != null) FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             template.models.forEachIndexed { i, m ->
                 val on = !otherModel && m == model
-                Text(m + if (i == 0) " · 推荐" else "", style = RsType.subhead, color = if (on) Color.White else c.textSecondary,
-                    modifier = Modifier.clip(CircleShape).background(if (on) c.accent else c.background).springClick { model = m; otherModel = false; result = null }
+                Text(m + if (i == 0) " · 推荐" else "", style = RsType.subhead, color = if (on) c.onSelected else c.textSecondary,
+                    modifier = Modifier.clip(CircleShape).background(if (on) c.selected else c.fill).springClick { model = m; otherModel = false; result = null }
                         .padding(horizontal = 12.dp, vertical = 8.dp))
             }
-            Text("其他", style = RsType.subhead, color = if (otherModel) Color.White else c.textSecondary,
-                modifier = Modifier.clip(CircleShape).background(if (otherModel) c.accent else c.background).springClick { otherModel = true; model = ""; result = null }
+            Text("其他", style = RsType.subhead, color = if (otherModel) c.onSelected else c.textSecondary,
+                modifier = Modifier.clip(CircleShape).background(if (otherModel) c.selected else c.fill).springClick { otherModel = true; model = ""; result = null }
                     .padding(horizontal = 12.dp, vertical = 8.dp))
         }
         if (custom || otherModel) SheetInput(model, "模型名，如 deepseek-flash") { model = it.trim(); result = null }
         fetched?.let { list ->
             if (list.isEmpty()) Text("没拉到模型列表，可以手动填写", style = RsType.caption, color = c.textTertiary)
-            else Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).clip(RoundedCornerShape(14.dp)).background(c.background)
+            else Column(Modifier.fillMaxWidth().heightIn(max = 220.dp).clip(RoundedCornerShape(14.dp)).background(c.fill)
                 .verticalScroll(rememberScrollState())) {
                 list.forEach { m ->
                     val on = m == model
@@ -337,12 +337,4 @@ private fun SmallChip(text: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun FailoverToggle(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by androidx.compose.animation.animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by androidx.compose.animation.core.animateDpAsState(if (on) 20.dp else 0.dp,
-        androidx.compose.animation.core.spring(dampingRatio = 0.65f, stiffness = androidx.compose.animation.core.Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+private fun FailoverToggle(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)

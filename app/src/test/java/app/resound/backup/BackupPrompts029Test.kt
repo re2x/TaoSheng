@@ -1,5 +1,8 @@
 package app.resound.backup
 
+import app.resound.data.open
+
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
@@ -24,7 +27,6 @@ import org.robolectric.annotation.SQLiteMode
 import java.io.File
 import java.time.LocalDate
 import java.time.ZoneId
-import java.util.Collections
 import java.util.zip.ZipFile
 
 @RunWith(RobolectricTestRunner::class)
@@ -37,10 +39,11 @@ class BackupPrompts029Test {
     private lateinit var server: MockWebServer
     private lateinit var client: WebDavClient
     @Before fun setup() {
+        webDavPause = {}
         context = RuntimeEnvironment.getApplication()
         context.deleteDatabase("capture.db")
-        db = Room.databaseBuilder(context, CaptureDatabase::class.java, "capture.db").allowMainThreadQueries().build()
-        db.openHelper.writableDatabase
+        db = Room.databaseBuilder(context, CaptureDatabase::class.java, "capture.db").setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
+        db.testSql.version
         root = File(context.cacheDir, "029-test").apply { deleteRecursively(); mkdirs() }
         listOf("before-restore", "backup-restore", "backup-restore-done").forEach { File(context.noBackupFilesDir, it).deleteRecursively() }
         File(context.filesDir, "prompts").deleteRecursively()
@@ -88,7 +91,7 @@ class BackupPrompts029Test {
         context.getSharedPreferences("capture", 0).edit().putString("probe", "local-before").commit()
         val stage = File(root, "old").apply { mkdirs() }
         val file = File(stage, BackupArchive.DATABASE).apply { parentFile!!.mkdirs() }
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/10.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/10.json").readText()).getJSONObject("database")
         SQLiteDatabase.openOrCreateDatabase(file, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { i ->
@@ -124,20 +127,20 @@ class BackupPrompts029Test {
         BackupRestore.applyPending(context)
         assertFalse(File(context.filesDir, "prompts/digest.md").exists())
         val restored = CaptureDatabase.open(context)
-        try { assertEquals(androidx.room.Room.databaseBuilder(context, CaptureDatabase::class.java, "version-probe.db").build().let { probe -> try { probe.openHelper.writableDatabase.version } finally { probe.close() } }, restored.openHelper.writableDatabase.version) } finally { restored.close() }
+        try { assertEquals(CaptureDatabase.VERSION, restored.testSql.version) } finally { restored.close() }
         assertTrue(File(context.noBackupFilesDir, "before-restore").listFiles()!!.single().isFile)
     }
     @Test fun newerVersionIsRejectedBeforeSnapshotOrReplacement() {
         val stage = File(root, "future").apply { mkdirs() }
         BackupArchive.snapshot(db, File(stage, BackupArchive.DATABASE).apply { parentFile!!.mkdirs() })
         val zip = File(root, "future.zip")
-        BackupArchive.pack(stage, zip, 123, "future", db.openHelper.writableDatabase.version + 1)
+        BackupArchive.pack(stage, zip, 123, "future", db.testSql.version + 1)
         server.enqueue(MockResponse().setBody(okio.Buffer().write(zip.readBytes())))
         assertEquals("备份数据库版本比 App 新，请先升级 App", failure {
             BackupRestore.restore(context, client, "回响-2026-10-24-0310.zip", db,
                 closeDatabase = { fail("不应关闭") }, restartProcess = { fail("不应重启") })
         })
-        assertTrue(db.isOpen)
+        assertEquals(CaptureDatabase.VERSION, db.testSql.version)
         assertFalse(File(context.noBackupFilesDir, "before-restore").exists())
         assertFalse(File(context.noBackupFilesDir, "backup-restore").exists())
     }
@@ -170,50 +173,62 @@ class BackupPrompts029Test {
             override suspend fun markdown(from: LocalDate, to: LocalDate, includeLines: Boolean) = "# 日记 $from"
             override suspend fun exportFile(from: LocalDate, to: LocalDate, includeLines: Boolean): Uri = error("不调用")
         }
-        val requests = Collections.synchronizedList(mutableListOf<RecordedRequest>())
-        var failUpload = true
-        server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse {
-                requests += request
-                return when {
-                    request.method == "GET" || request.method == "HEAD" -> MockResponse().setResponseCode(404)
-                    request.method == "PROPFIND" -> listing(emptyList())
-                    request.method == "PUT" && WebDavClient.DIARY_FOLDER !in request.requestUrl!!.pathSegments && failUpload -> MockResponse().setResponseCode(503)
-                    else -> MockResponse().setResponseCode(201)
-                }
-            }
-        }
+        val remote = BackupWebDavDispatcher().apply { failBackupUploads = true }
+        server.dispatcher = remote
+        val requests = remote.requests
         val repository = AndroidBackupRepository(context, db, diary = diary, passphrases = store, clientFactory = { client })
         val snapshot = File(context.noBackupFilesDir, "before-restore/keep.zip").apply { parentFile!!.mkdirs(); writeText("snapshot") }
         repository.setEncryption("test-only"); repository.setEnabled(true)
         assertTrue(repository.state.value.encrypted)
         assertTrue(repository.runBackup(true)); assertTrue(snapshot.exists())
-        failUpload = false
+        assertEquals("坚果云服务器暂时出错，稍后自动重试", repository.state.value.lastError)
+        assertTrue(repository.remoteBackups().getOrThrow().isEmpty())
+        assertFalse(requests.any { it.method == "PUT" && WebDavClient.DIARY_FOLDER in it.requestUrl!!.pathSegments })
+        remote.failBackupUploads = false
         assertFalse(repository.runBackup(true)); assertNull(repository.state.value.lastError)
         assertFalse(snapshot.exists())
+        val encryptedPoint = repository.remoteBackups().getOrThrow().single()
+        assertTrue(encryptedPoint.encrypted)
         repository.setEncryption(null)
         assertFalse(repository.state.value.encrypted)
         assertFalse(repository.runBackup(true)); assertNull(repository.state.value.lastError)
-        val moves = requests.filter { it.method == "MOVE" }.map { it.getHeader("Destination")!! }
-        assertTrue(moves[0].endsWith(".zip.enc")); assertTrue(moves[1].endsWith(".zip"))
-        val uploads = requests.filter { it.method == "PUT" && WebDavClient.FOLDER in it.requestUrl!!.pathSegments }
-        assertFalse(uploads[1].body.clone().readByteArray().take(2) == listOf(80.toByte(), 75.toByte()))
-        assertEquals(listOf(80.toByte(), 75.toByte()), uploads[2].body.clone().readByteArray().take(2))
+        val points = repository.remoteBackups().getOrThrow()
+        assertEquals(2, points.size)
+        val plainPoint = points.single { it.name != encryptedPoint.name }
+        assertFalse(plainPoint.encrypted)
+        // 卡 039 后扩展名属于逻辑分卷；远端 .bin 对象须由恢复点的引用定位。
+        fun stateObject(point: RemoteBackup, logical: String): File {
+            val checkpoint = JSONObject(remote.read("/dav/${WebDavClient.FOLDER}/${point.name}").toString(Charsets.UTF_8))
+            assertEquals(point.encrypted, checkpoint.getBoolean("encrypted"))
+            val refs = checkpoint.getJSONArray("refs")
+            val state = (0 until refs.length()).map(refs::getJSONObject).single { it.getString("logical") == logical }
+            return File(root, logical).apply { writeBytes(remote.read("/dav/${WebDavClient.FOLDER}/${state.getString("path")}")) }
+        }
+        val encrypted = stateObject(encryptedPoint, "resound-state.zip.enc")
+        assertTrue(BackupEncryption.isEncrypted(encrypted))
+        val decrypted = File(root, "decrypted-state.zip")
+        BackupEncryption.decrypt(encrypted, decrypted, "test-only", null)
+        val plain = stateObject(plainPoint, "resound-state.zip")
+        assertFalse(BackupEncryption.isEncrypted(plain))
+        for (file in listOf(decrypted, plain)) ZipFile(file).use { assertNotNull(it.getEntry("settings.json")) }
         assertEquals(4, requests.count { it.method == "PUT" && WebDavClient.DIARY_FOLDER in it.requestUrl!!.pathSegments })
-        assertTrue(requests.filter { it.method == "DELETE" }.all { it.requestUrl!!.pathSegments.last().let { name -> name.endsWith(".part") || name.startsWith("resound-state.") } })
+        assertFalse(remote.paths().any { it.endsWith(".part") })
+        assertTrue(requests.filter { it.method == "DELETE" }.all { it.requestUrl!!.pathSegments.last().endsWith(".part") })
         repository.setEnabled(false)
     }
     @Test fun templatesReadDefaultsAndPersistOverridesInBackup() {
         val templates = LocalPromptTemplates(context)
-        assertEquals(listOf("digest", "review", "ask"), templates.list.value.map { it.id })
-        for (id in listOf("digest", "review", "ask")) {
+        // 卡 203 新增夜里周报模板 night_week
+        val expectedIds = listOf("digest", "review", "ask", "things", "night_week", "merge")
+        assertEquals(expectedIds, templates.list.value.map { it.id })
+        for (id in expectedIds) {
             assertEquals(templates.defaultText(id), templates.text(id))
             assertTrue(templates.save(id, templates.defaultText(id) + "\n自定义规则").isSuccess)
             assertTrue(LocalPromptTemplates(context).text(id).endsWith("自定义规则"))
         }
         assertTrue(templates.list.value.all { it.customized })
         ZipFile(archive()).use { zip ->
-            for (id in listOf("digest", "review", "ask")) {
+            for (id in expectedIds) {
                 assertEquals(templates.text(id), zip.getInputStream(zip.getEntry("files/prompts/$id.md")).bufferedReader().readText())
             }
         }

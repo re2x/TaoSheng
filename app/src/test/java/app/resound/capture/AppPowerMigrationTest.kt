@@ -1,5 +1,6 @@
 package app.resound.capture
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -24,7 +25,7 @@ class AppPowerMigrationTest {
         val context = RuntimeEnvironment.getApplication() as Context
         val name = "power-migration.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/3.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/3.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -39,17 +40,17 @@ class AppPowerMigrationTest {
             old.execSQL("INSERT INTO battery VALUES (1,1000,80,0)")
             old.version = 3
         }
-        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, db.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, db.testSql.version)
             assertEquals(80, db.capture().batteries(0, 2000).first().single().percent)
             val date = LocalDate.now()
             val start = date.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
             for (i in 0..3) db.capture().appPower(AppPowerEntity(at = start + i * 600_000L,
                 elapsedMs = i * 600_000L, session = "s", cpuMs = i * 1000L, txBytes = i * 1_000_000L,
                 rxBytes = i * 1_000_000L, micMs = i * 600_000L, charging = false, chargeEpoch = 0, capacityMah = 4880.0))
-            val repo = RoomCaptureStatsRepository(context, db.capture())
+            val repo = RoomCaptureStatsRepository(context, db.capture(), app.resound.platform.SystemZone)
             assertNotNull(repo.dayStats(date).first().appPowerPerHour)
             val export = repo.exportDiagnostics()
             try {

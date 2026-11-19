@@ -1,5 +1,6 @@
 package app.resound.diagnostics
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -116,12 +117,12 @@ class AskCompatibility136Test {
     }
 
     @Test fun realPrefetchFiltersTimeAndPersistsModeAndReferencesWithoutSchemaChange() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java)
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver())
             .addCallback(SearchIndex.callback).allowMainThreadQueries().build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val at = AskTools.timestamp("2026-11-10 09:00", false, ZoneId.systemDefault())
         try {
-            val sql = db.openHelper.writableDatabase
+            val sql = db.testSql
             sql.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(1,?,?,'mic','test',1,'Done')", arrayOf(at, at + 1000))
             for (id in 1..2) {
                 val time = at + (id - 1) * 12 * 3600_000L
@@ -137,7 +138,7 @@ class AskCompatibility136Test {
                     assertEquals(0, definitions.length()); assertTrue(messages.toString().contains("给老王发方案"))
                     LlmStreamReply("给老王发方案[^1]", emptyList())
                 }, JSONArray(), { _, _, _ -> error("模型不能再查") }, { _, _ -> }, mode = { AskMode.Prefetch }, prefetch = prefetch::read)
-            }, system = { "" }, recommended = AskSuggestions(prefs, { false }, { "" }, { emptyList() }))
+            }, system = { "" }, recommended = AskSuggestions(prefs, { false }, { "" }, { emptyList() }), now = System::currentTimeMillis)
             val repo = repository(); repo.ask("今天上午方案")
             val result = withTimeout(5000) { repo.messages.first { it.size == 2 && !it.last().streaming } }.last()
             assertNull(result.error); assertEquals(AskMode.Prefetch, result.mode)
@@ -145,7 +146,7 @@ class AskCompatibility136Test {
             val loaded = withTimeout(5000) { repository().messages.first { it.size == 2 } }.last()
             assertEquals(result, loaded)
             assertEquals(AskMode.Tools, AskCitations.mode("[]"))
-            assertEquals(CaptureDatabase.VERSION, db.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, db.testSql.version)
         } finally { scope.cancel(); scope.coroutineContext[Job]!!.join(); db.close() }
     }
 }

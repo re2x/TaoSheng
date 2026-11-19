@@ -1,5 +1,7 @@
 package app.resound.ui.skills
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.datetime.toKotlinLocalDate
 import app.resound.appDisplayName
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -38,7 +40,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,13 +87,13 @@ fun SkillsPage(
     bottomPadding: Dp,
     corePage: @Composable (String, Dp) -> Unit,
 ) {
-    val backendSkills by repo.skills.collectAsState()
+    val backendSkills by repo.skills.collectAsStateWithLifecycle()
     // “问问”不出卡片，但它的提示词也归到技能页的“基础”里统一改
     val skills = remember(backendSkills) {
         val i = backendSkills.indexOfLast { it.origin == SkillOrigin.Core } + 1
         (backendSkills.take(i) + ASK_CORE + backendSkills.drop(i)).map { s -> CORE_SUMMARY[s.id]?.let { s.copy(summary = it) } ?: s }
     }
-    val status by repo.status.collectAsState()
+    val status by repo.status.collectAsStateWithLifecycle()
     var openId by rememberSaveable { mutableStateOf<String?>(null) }
     val open = skills.firstOrNull { it.id == openId }
     // 正在编辑的技能（新建时是空白模板）
@@ -240,12 +241,16 @@ private fun weekdayText(days: Set<Int>): String = when {
 
 private fun hm(minutes: Int) = "%d:%02d".format(minutes / 60, minutes % 60)
 
-private fun statusLine(st: SkillStatus?): Pair<String, Boolean>? = when {
-    st == null -> null
-    st.running -> "正在运行…" to false
-    st.lastFailed && st.lastResult != null -> st.lastResult to true
-    st.lastRunAt != null && st.lastResult != null -> "${shortTime(st.lastRunAt)} ${st.lastResult}" to false
-    else -> null
+private fun statusLine(st: SkillStatus?): Pair<String, Boolean>? {
+    val lastResult = st?.lastResult
+    val lastRunAt = st?.lastRunAt
+    return when {
+        st == null -> null
+        st.running -> "正在运行…" to false
+        st.lastFailed && lastResult != null -> lastResult to true
+        lastRunAt != null && lastResult != null -> "${shortTime(lastRunAt)} ${lastResult}" to false
+        else -> null
+    }
 }
 
 private fun shortTime(at: Long): String {
@@ -253,23 +258,16 @@ private fun shortTime(at: Long): String {
 }
 
 @Composable
-internal fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by animateDpAsState(if (on) 20.dp else 0.dp, spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+internal fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)
 
 /** 分段胶囊：一排选项，选中的白底 */
 @Composable
 internal fun Segments(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
     val c = Rs.colors
-    Row(Modifier.clip(CircleShape).background(c.separator.copy(alpha = if (c.isDark) 1f else 0.7f)).padding(3.dp)) {
+    Row(Modifier.clip(CircleShape).background(c.track).padding(3.dp)) {
         options.forEachIndexed { i, label ->
             val on = i == selected
-            val bg by animateColorAsState(if (on) c.card else c.card.copy(alpha = 0f), label = "seg")
+            val bg by animateColorAsState(if (on) c.trackThumb else c.trackThumb.copy(alpha = 0f), label = "seg")
             Box(Modifier.clip(CircleShape).background(bg).springClick { onSelect(i) }.padding(horizontal = 14.dp, vertical = 7.dp)) {
                 Text(label, style = RsType.subhead, color = if (on) c.text else c.textSecondary)
             }
@@ -333,14 +331,14 @@ private fun SkillDetail(s: Skill, st: SkillStatus?, repo: SkillRepository, prese
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         (1..7).forEach { d ->
                             val on = t.weekdays.isEmpty() || d in t.weekdays
-                            Box(Modifier.size(34.dp).clip(CircleShape).background(if (on) c.accent else c.background)
+                            Box(Modifier.size(34.dp).clip(CircleShape).background(if (on) c.selected else c.fill)
                                 .springClick {
                                     val cur = t.weekdays.ifEmpty { (1..7).toSet() }
                                     val next = if (d in cur) cur - d else cur + d
                                     if (next.isNotEmpty()) repo.setSchedule(s.id, t.minutes, if (next.size == 7) emptySet() else next)
                                 },
                                 contentAlignment = Alignment.Center) {
-                                Text(WEEK[d - 1], style = RsType.subhead, color = if (on) Color.White else c.textSecondary)
+                                Text(WEEK[d - 1], style = RsType.subhead, color = if (on) c.onSelected else c.textSecondary)
                             }
                         }
                     }
@@ -371,8 +369,8 @@ private fun SkillDetail(s: Skill, st: SkillStatus?, repo: SkillRepository, prese
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     (listOf<LlmPreset?>(null) + presets).forEach { p ->
                         val on = s.presetId == p?.id
-                        Text(p?.name ?: "跟随整理模型", style = RsType.subhead, color = if (on) Color.White else c.text,
-                            modifier = Modifier.clip(CircleShape).background(if (on) c.accent else c.background).springClick { repo.setPreset(s.id, p?.id) }
+                        Text(p?.name ?: "跟随整理模型", style = RsType.subhead, color = if (on) c.onSelected else c.text,
+                            modifier = Modifier.clip(CircleShape).background(if (on) c.selected else c.fill).springClick { repo.setPreset(s.id, p?.id) }
                                 .padding(horizontal = 14.dp, vertical = 8.dp))
                     }
                 }
@@ -443,7 +441,7 @@ private fun SkillDetail(s: Skill, st: SkillStatus?, repo: SkillRepository, prese
 @Composable
 private fun Stepper(text: String, onClick: () -> Unit) {
     val c = Rs.colors
-    Box(Modifier.size(38.dp).clip(CircleShape).background(c.background).springClick(onClick), contentAlignment = Alignment.Center) {
+    Box(Modifier.size(38.dp).clip(CircleShape).background(c.fill).springClick(onClick), contentAlignment = Alignment.Center) {
         Text(text, style = RsType.title, color = c.textSecondary)
     }
 }
@@ -479,15 +477,15 @@ private fun TryCard(s: Skill, repo: SkillRepository, prompt: String?) {
     var saved by remember { mutableStateOf(false) }
     val date = LocalDate.now().minusDays(day.toLong())
     // 生成走后台（切页面不中断），试跑只是预览、留在本页
-    val generating = (s.id to date) in repo.generating.collectAsState().value
-    val generated = repo.generated.collectAsState().value[s.id to date]
+    val generating = (s.id to date.toKotlinLocalDate()) in repo.generating.collectAsStateWithLifecycle().value
+    val generated = repo.generated.collectAsStateWithLifecycle().value[s.id to date.toKotlinLocalDate()]
     if (saved && !generating && generated != null) result = generated
     fun go(save: Boolean) {
         if (busy || generating) return
         result = null; saved = save
-        if (save) { repo.generate(s.id, date); return }
+        if (save) { repo.generate(s.id, date.toKotlinLocalDate()); return }
         busy = true
-        scope.launch { result = try { repo.trial(s.id, date, prompt) } finally { busy = false } }
+        scope.launch { result = try { repo.trial(s.id, date.toKotlinLocalDate(), prompt) } finally { busy = false } }
     }
     RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 16.dp)) {
         Text("试一下", style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text)
@@ -508,7 +506,7 @@ private fun TryCard(s: Skill, repo: SkillRepository, prompt: String?) {
                 ResultNote(if (saved) "已生成 ${r.cards.size} 张，放进了记忆里" else "预览 ${r.cards.size} 张（没有保存）", false)
                 r.cards.forEach { card ->
                     Spacer(Modifier.height(10.dp))
-                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(14.dp)) {
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(14.dp)) {
                         app.resound.ui.ReportCopyActions(blocks = { app.resound.ui.skillCardCopyBlocks(card) }) { app.resound.ui.skillCardCopyText(card) }
                         androidx.compose.foundation.text.selection.SelectionContainer {
                             Column {
@@ -543,7 +541,7 @@ private fun PromptSheet(s: Skill, repo: SkillRepository, onDismiss: () -> Unit) 
         BasicTextField(
             text, { text = it; error = null },
             textStyle = RsType.subhead.copy(color = c.text, lineHeight = 20.sp), cursorBrush = SolidColor(c.accent),
-            modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 380.dp).clip(RoundedCornerShape(14.dp)).background(c.background)
+            modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 380.dp).clip(RoundedCornerShape(14.dp)).background(c.fill)
                 .verticalScroll(rememberScrollState()).padding(14.dp),
         )
         error?.let { Text(it, style = RsType.subhead, color = c.critical) }

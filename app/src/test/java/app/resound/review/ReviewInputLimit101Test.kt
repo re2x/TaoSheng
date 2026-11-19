@@ -43,13 +43,13 @@ class ReviewInputLimit101Test {
     private suspend fun repository(preset: LlmPreset, e: MemoryEventEntity,
         chat: suspend (LlmPreset, String, String, String) -> LlmReply,
         check: suspend (RoomReviewRepository) -> Unit) {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val prefs = context.getSharedPreferences("review101", 0).apply { edit().clear().commit() }
         val repo = RoomReviewRepository(db.review(), db.memory(), prefs, scope, { preset to "test" }, chat,
             { "只输出 JSON" }, "涛声", object : Notifier {
                 override suspend fun send(title: String, body: String, deepLink: String?, topic: PushTopic?) = Unit
-            }, {}, now = { at + 22 * 3600000 }, zone = { zone })
+            }, {}, now = { at + 22 * 3600000 }, zone = { zone }, io = kotlinx.coroutines.Dispatchers.IO)
         try { db.memory().insertEvent(e); check(repo) }
         finally { scope.cancel(); db.close() }
     }
@@ -118,7 +118,10 @@ class ReviewInputLimit101Test {
         val old = LlmInputBudget.parse("""[{"id":"old","models":["legacy"]}]""")
         assertEquals(128_000, old.getValue("old" to "legacy").contextTokens)
         assertEquals(113_408, old.getValue("old" to "legacy").inputChars)
-        assertEquals(12, AndroidLlmProviders.parseTemplates(assets()).size)
+        // 目录可新增服务商（卡 116 新增 OpenCode Go），不把数量当协议。
+        val catalog = JSONArray(assets())
+        val expectedIds = (0 until catalog.length()).map { catalog.getJSONObject(it).getString("id") }
+        assertEquals(expectedIds, AndroidLlmProviders.parseTemplates(assets()).map { it.id })
     }
 
     @Test fun fallbackAndMissingWorkerShowChinese() = runBlocking {

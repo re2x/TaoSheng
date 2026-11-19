@@ -22,15 +22,22 @@ import java.io.File
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [29], manifest = Config.NONE, application = Application::class)
 class LocalAsrFailure063Test {
+    @get:Rule val envSoundScope = app.resound.envsound.AppGraphEnvSoundRule()
     private val context get() = RuntimeEnvironment.getApplication() as Context
     private lateinit var db: CaptureDatabase
     private lateinit var directory: File
+    private lateinit var diagnosticScope: CoroutineScope
     @Before fun setup() {
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
+        // 使用本用例的数据库，不继承其他测试留在 AppGraph 中的已关闭仓储。
+        diagnosticScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        app.resound.AppGraph.envSound = app.resound.envsound.LocalEnvSoundRepository(db,
+            context.getSharedPreferences("failure063-env", 0), diagnosticScope,
+            MutableStateFlow(app.resound.envsound.EnvModelState.NotDownloaded), {}, { error("禁止模型调用") }, {}, zoneProvider=app.resound.platform.SystemZone, now = app.resound.platform.SystemNow::now, io = kotlinx.coroutines.Dispatchers.IO)
         directory = File(context.cacheDir, "failure063").apply { mkdirs() }
         context.getSharedPreferences("pipeline-times", 0).edit().clear().commit()
     }
-    @After fun close() { db.close(); directory.deleteRecursively() }
+    @After fun close() = runBlocking { diagnosticScope.coroutineContext[Job]!!.cancelAndJoin(); db.close(); directory.deleteRecursively(); Unit }
     private fun failure(phase: String, error: Throwable) = Bundle().apply { LocalAsrFailure.write(this, phase, error) }
 
     @Test fun missingAudioIsSpecificAndDoesNotStopLaterSegmentsOrRetryForever() = runBlocking {
@@ -47,15 +54,20 @@ class LocalAsrFailure063Test {
                 return AsrResult(listOf(AsrSentence(0, 100, "成功", null)), 500, null)
             }
         }
-        val runner = TranscribeRunner(db.transcribe(), provider, { "" }, { _, _ -> }, deferAudioCleanup = true)
+        val runner = TranscribeRunner(db.transcribe(), provider, { "" }, { _, _ -> })
         assertFalse(runner.run())
-        assertEquals(listOf("missing.ogg", "good.ogg"), calls)
+        // 卡 065：缺文件在转写前直接放弃，保留失败记录且不交给转写器。
+        assertEquals(listOf("good.ogg"), calls)
         val failed = db.transcribe().segment(1)
-        assertEquals("Failed", failed.status); assertEquals("录音文件已不存在", failed.error)
+        assertEquals("Abandoned", failed.status); assertEquals("录音文件已不存在", failed.error)
         assertEquals(1, failed.attempts); assertNull(failed.nextRetryAt)
+        assertNotNull(failed.completedAt); assertEquals(failed.completedAt, failed.firstFailedAt)
         assertEquals("Done", db.transcribe().segment(2).status)
-        assertEquals("Audio", db.transcribe().recentAttempts().single { it.segmentId == 1L }.errorType)
+        val attempt = db.transcribe().recentAttempts().single { it.segmentId == 1L }
+        assertEquals("Audio", attempt.errorType); assertEquals("Abandoned", attempt.result)
+        assertEquals(0L, attempt.sentMillis)
         assertTrue(db.transcribe().candidates(Long.MAX_VALUE).isEmpty())
+        assertNull(db.transcribe().earliestRetry())
         assertFalse(AsrError.Audio in TranscribePolicy.ROUND_STOPPERS)
     }
 
@@ -102,7 +114,7 @@ class LocalAsrFailure063Test {
             override fun setAutoCheck(enabled: Boolean) {}
             override fun canInstall() = false
         }
-        val report = LocalProblemReports(context, CrashRecords(context), RoomCaptureStatsRepository(context, db.capture()), updater).export()
+        val report = LocalProblemReports(context, CrashRecords(context), RoomCaptureStatsRepository(context, db.capture(), app.resound.platform.SystemZone), updater).export()
         try {
             val text = report.readText()
             assertTrue(text.contains("phase=audio errorType=Audio exceptionClass=java.lang.IllegalArgumentException"))

@@ -121,7 +121,7 @@ internal class TimelineSelection {
 @Composable
 internal fun SelectCircle(selected: Boolean) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (selected) c.accent else Color.Transparent, label = "selBg")
+    val bg by animateColorAsState(if (selected) c.selected else Color.Transparent, label = "selBg")
     val pop by animateFloatAsState(if (selected) 1f else 0.92f, spring(dampingRatio = 0.45f, stiffness = Spring.StiffnessMedium), label = "selPop")
     Box(
         Modifier.size(22.dp).scale(pop).clip(CircleShape).background(bg)
@@ -173,8 +173,8 @@ internal fun BoxScope.SelectBottomBar(selection: TimelineSelection, order: List<
             }
             Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 BarChip("重做", c.accentSoft, c.accent, n > 0, Modifier.weight(1f), onRedo)
-                BarChip("复制", c.background, c.text, n > 0, Modifier.weight(1f), onCopy)
-                BarChip("导出", c.accent, Color.White, n > 0, Modifier.weight(1f), onExport)
+                BarChip("复制", c.fill, c.text, n > 0, Modifier.weight(1f), onCopy)
+                BarChip("导出", c.accent, c.onAccent, n > 0, Modifier.weight(1f), onExport)
                 BarChip(if (n > 0) "删除 $n 件" else "删除", c.critical, Color.White, n > 0, Modifier.weight(1.2f), onDelete)
             }
         }

@@ -1,5 +1,7 @@
 package app.resound.backup
 
+import app.resound.diagnostics.FailureNotes
+
 import android.content.SharedPreferences
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -13,7 +15,8 @@ internal object CloudAddress {
         val parts = url.host.split('.')
         val octets = parts.mapNotNull { it.toIntOrNull()?.takeIf { n -> n in 0..255 } }
         val privateIp = parts.size == 4 && octets.size == 4 && (octets[0] == 10 || octets[0] == 172 && octets[1] in 16..31 || octets[0] == 192 && octets[1] == 168)
-        require(url.isHttps || privateIp || url.host.endsWith(".local")) { "请使用 HTTPS；HTTP 只允许局域网 IP 或 .local 地址" }
+        val usbLoopback = url.host == "127.0.0.1" || url.host == "::1"
+        require(url.isHttps || privateIp || usbLoopback || url.host.endsWith(".local")) { "请使用 HTTPS；HTTP 只允许局域网、USB 本机地址或 .local 地址" }
         return url
     }
     fun s3(settings: S3Settings): S3Settings {
@@ -44,7 +47,9 @@ internal class CloudSettings(private val prefs: SharedPreferences, private val s
     val hasSecret: Boolean get() = secrets.has(secretKey(kind))
     val webDavUrl: String? get() = prefs.getString("webDavUrl", null)
     val s3: S3Settings? get() = prefs.getString("s3", null)?.let(::s3FromJson)
-    fun password(): String = try { secrets.read(secretKey(kind)) } catch (_: Exception) { throw BackupFailure("云端密钥读取失败，请重新填写") }
+    fun password(): String = try { secrets.read(secretKey(kind)) } catch (caught: Exception) {
+        FailureNotes.record("backup/CloudSettings.kt:47", caught)
+        throw BackupFailure("云端密钥读取失败，请重新填写") }
     fun save(kind: CloudKind, account: String, secret: String?, webDavUrl: String?, s3: S3Settings?) {
         val login = account.trim()
         require(login.isNotBlank() && login.none { it.isISOControl() } && ':' !in login) { "请填写正确的账号或访问密钥 ID" }

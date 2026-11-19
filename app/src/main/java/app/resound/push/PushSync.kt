@@ -1,5 +1,8 @@
 package app.resound.push
 
+import app.resound.platform.SharedJson
+import app.resound.transcribe.VoiceInputMetadata
+
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -103,6 +106,7 @@ internal class FolderSync(private val remote: FolderStorage, private val state: 
         // 本地指纹表也按白名单校验，避免恢复/损坏状态把删除扩大到用户目录。
         fun owned(path: String): Boolean = path in setOf("README.md", "recent-days-index.md", "starred-highlights.md", "todos-and-appointments.md", "ideas.md", "decisions-and-facts.md") ||
             path.matches(Regex("(?:daily|transcripts)/[0-9]{4}-[0-9]{2}/[0-9]{4}-[0-9]{2}-[0-9]{2}-[A-Za-z]{3}_(?:daily-record|transcript)\\.md")) ||
+            path.matches(Regex("周报/[0-9]{4}-W(?:0[1-9]|[1-4][0-9]|5[0-3])[.]md")) ||
             path.matches(Regex("weekly/[0-9]{4}-W[0-9]{2}_[0-9]{4}-[0-9]{4}_weekly-review\\.md")) ||
             path.matches(Regex("archive/[0-9]{4}/(?:ideas|decisions-and-facts)\\.md"))
     }
@@ -134,13 +138,15 @@ internal class FolderSync(private val remote: FolderStorage, private val state: 
 }
 
 internal object RecordDelta {
-    fun records(input: PushSnapshot, s: PushSubscription): Map<String, JSONObject> = buildMap {
+    suspend fun records(input: PushSnapshot, s: PushSubscription): Map<String, JSONObject> = buildMap {
         val data = input.validated()
         data.events.filter { RecordKind.Timeline in s.records || (RecordKind.Starred in s.records && it.starred) }.forEach { e ->
             put("event:${e.id}", JSONObject().put("id", e.id).put("start", e.startAt).put("end", e.endAt).put("title", e.title).put("summary", e.summary)
-                .put("points", JSONArray(e.pointsJson)).put("people", JSONArray(e.peopleJson)).put("scene", e.scene).put("important", e.important).put("starred", e.starred).put("starredAt", e.starredAt ?: JSONObject.NULL))
+                .put("points", JSONArray(e.pointsJson)).put("people", JSONArray(e.peopleJson)).put("scene", e.scene).put("important", e.important).put("starred", e
+                    .starred).put("starredAt", e.starredAt ?: JSONObject.NULL))
         }
-        data.items.forEach { i -> put("item:${i.id}", JSONObject().put("id", i.id).put("eventId", i.eventId ?: JSONObject.NULL).put("origin", i.origin).put("sourceText", i.sourceText ?: JSONObject.NULL).put("category", i.category).put("kind", i.kind ?: JSONObject.NULL)
+        data.items.forEach { i -> put("item:${i.id}", JSONObject().put("id", i.id).put("eventId", i.eventId ?: JSONObject.NULL).put("origin", i.origin).put("sourceText",
+            i.sourceText ?: JSONObject.NULL).put("category", i.category).put("kind", i.kind ?: JSONObject.NULL)
             .put("content", i.content).put("status", i.status).put("at", i.createdAt).put("due", i.dueAt ?: i.dueText ?: JSONObject.NULL)
             .put("doneAt", i.doneAt ?: JSONObject.NULL).put("who", i.who ?: JSONObject.NULL).put("repeats", data.repeats[i.id] ?: 1)) }
         data.cards.forEach { c -> put("card:${c.id}", JSONObject().put("id", c.id).put("date", LocalDate.ofEpochDay(c.date)).put("title", c.title)
@@ -148,15 +154,13 @@ internal object RecordDelta {
         data.reviews.forEach { r -> put("review:${r.id}", JSONObject().put("id", r.id).put("type", r.type).put("startDate", r.startDate).put("endDate", r.endDate)
             .put("brief", r.brief).put("sections", JSONArray(r.sectionsJson))) }
         data.lines.forEach { l -> put("line:${l.id}", JSONObject().put("id", l.id).put("at", l.startAt).put("end", l.endAt)
-            .put("eventId", l.eventId ?: JSONObject.NULL).put("speaker", l.speakerName ?: l.speakerTag ?: "某人").put("text", l.text).apply { app.resound.transcribe.VoiceInputMetadata.read(l.voiceInputJson)?.let { put("voice_input", app.resound.transcribe.VoiceInputMetadata.json(it, s.lineContext)) } }) }
+            .put("eventId", l.eventId ?: JSONObject.NULL).put("speaker", l.speakerName ?: l.speakerTag ?: "某人").put("text", l.text).apply { VoiceInputMetadata.read(l
+                .voiceInputJson)?.let { put("voice_input", VoiceInputMetadata.json(it, s.lineContext)) } }) }
     }
-    fun changes(current: Map<String, JSONObject>, old: JSONObject): JSONObject {
-        val changes = JSONArray()
-        fun entry(op: String, key: String, data: JSONObject) = JSONObject().put("op", op).put("kind", key.substringBefore(':')).put("id", key.substringAfter(':').toLong()).put("data", data)
-        current.toSortedMap().forEach { (key, data) -> if (old.optString(key) != sha256(canonical(data))) changes.put(entry("upsert", key, data)) }
-        old.keys().asSequence().toList().sorted().filter { it !in current && it !in PushTrace.current()?.skipped.orEmpty() }.forEach { changes.put(entry("delete", it, JSONObject())) }
-        return JSONObject().put("type", "records_delta").put("version", 1).put("changes", changes)
-    }
+    fun changes(current: Map<String, JSONObject>, old: JSONObject): JSONObject = JSONObject(RecordDeltaRules.changes(
+        current.mapValues { SharedJson.parseToJsonElement(it.value.toString()) as kotlinx.serialization.json.JsonObject },
+        old.keys().asSequence().associateWith { old.optString(it) }, PushTrace.current()?.skipped.orEmpty(),
+        { key -> sha256(canonical(current.getValue(key))) }).toString())
     fun acknowledge(current: Map<String, JSONObject>, state: PushSyncState) {
         state.records.keys().asSequence().toList().filter { it !in PushTrace.current()?.skipped.orEmpty() }.forEach { state.records.remove(it) }
         current.forEach { (key, data) -> state.records.put(key, sha256(canonical(data))) }; state.save()

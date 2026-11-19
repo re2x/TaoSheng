@@ -1,5 +1,7 @@
 package app.resound.ui.items
 
+import kotlinx.datetime.toKotlinLocalDate
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -40,7 +42,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDateRangePickerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -94,9 +95,9 @@ internal fun DatePickerStrip(memory: MemoryRepository, date: LocalDate, onPick: 
     var shownMonth by remember(date) { mutableStateOf(YearMonth.from(date)) }
     val weekStart = date.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
     // 一周可能跨两个月，两个月的打点都要
-    val active1 by remember(YearMonth.from(weekStart)) { memory.activeDays(YearMonth.from(weekStart)) }.collectAsState(initial = emptySet())
-    val active2 by remember(YearMonth.from(weekStart.plusDays(6))) { memory.activeDays(YearMonth.from(weekStart.plusDays(6))) }.collectAsState(initial = emptySet())
-    val monthActive by remember(shownMonth) { memory.activeDays(shownMonth) }.collectAsState(initial = emptySet())
+    val active1 by remember(YearMonth.from(weekStart)) { memory.activeDays(kotlinx.datetime.YearMonth(weekStart.year, weekStart.monthValue)) }.collectAsStateWithLifecycle(initialValue = emptySet())
+    val active2 by remember(YearMonth.from(weekStart.plusDays(6))) { memory.activeDays(weekStart.plusDays(6).let { kotlinx.datetime.YearMonth(it.year, it.monthValue) }) }.collectAsStateWithLifecycle(initialValue = emptySet())
+    val monthActive by remember(shownMonth) { memory.activeDays(kotlinx.datetime.YearMonth(shownMonth.year, shownMonth.monthValue)) }.collectAsStateWithLifecycle(initialValue = emptySet())
 
     RsCard(padding = PaddingValues(horizontal = 10.dp, vertical = 12.dp)) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -124,7 +125,7 @@ internal fun DatePickerStrip(memory: MemoryRepository, date: LocalDate, onPick: 
             Row(Modifier.fillMaxWidth()) {
                 for (i in 0..6) {
                     val d = weekStart.plusDays(i.toLong())
-                    DayCell(d, WEEKDAYS[i], d == date, d == today, d in active1 || d in active2, enabled = d <= today, Modifier.weight(1f)) {
+                    DayCell(d, WEEKDAYS[i], d == date, d == today, d.toKotlinLocalDate() in active1 || d.toKotlinLocalDate() in active2, enabled = d <= today, Modifier.weight(1f)) {
                         onPick(d)
                     }
                 }
@@ -146,7 +147,7 @@ internal fun DatePickerStrip(memory: MemoryRepository, date: LocalDate, onPick: 
                             if (n < 1 || n > shownMonth.lengthOfMonth()) Spacer(Modifier.weight(1f))
                             else {
                                 val d = shownMonth.atDay(n)
-                                DayCell(d, null, d == date, d == today, d in monthActive, enabled = d <= today, Modifier.weight(1f)) {
+                                DayCell(d, null, d == date, d == today, d.toKotlinLocalDate() in monthActive, enabled = d <= today, Modifier.weight(1f)) {
                                     monthOpen = false; onPick(d)
                                 }
                             }
@@ -169,9 +170,9 @@ private fun NavArrow(text: String, enabled: Boolean = true, onClick: () -> Unit)
 @Composable
 private fun DayCell(d: LocalDate, weekday: String?, selected: Boolean, today: Boolean, active: Boolean, enabled: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (selected) c.accent else c.accent.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "dayBg")
+    val bg by animateColorAsState(if (selected) c.selected else c.accent.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "dayBg")
     val fg = when {
-        selected -> Color.White
+        selected -> c.onSelected
         !enabled -> c.separator
         today -> c.accent
         else -> c.text
@@ -509,7 +510,7 @@ internal fun ExportSheet(diary: DiaryRepository, date: LocalDate, onClose: () ->
     val c = Rs.colors
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val sync by diary.cloudSync.collectAsState()
+    val sync by diary.cloudSync.collectAsStateWithLifecycle()
     var range by remember { mutableStateOf(Range.Day) }
     var withLines by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
@@ -592,23 +593,15 @@ internal fun ExportSheet(diary: DiaryRepository, date: LocalDate, onClose: () ->
 @Composable
 private fun Choice(text: String, on: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by animateColorAsState(if (on) c.accent else c.background, spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
-    val fg by animateColorAsState(if (on) Color.White else c.textSecondary, label = "choiceFg")
+    val bg by animateColorAsState(if (on) c.selected else c.fill, spring(stiffness = Spring.StiffnessMediumLow), label = "choice")
+    val fg by animateColorAsState(if (on) c.onSelected else c.textSecondary, label = "choiceFg")
     Box(modifier.clip(CircleShape).background(bg).springClick(onClick).padding(vertical = 9.dp), contentAlignment = Alignment.Center) {
         Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = fg)
     }
 }
 
 @Composable
-private fun Switch(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by androidx.compose.animation.core.animateDpAsState(if (on) 20.dp else 0.dp,
-        spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+private fun Switch(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

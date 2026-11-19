@@ -1,5 +1,6 @@
 package app.resound.importer
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import android.net.Uri
@@ -61,7 +62,7 @@ class FolderImports117Test {
         context = RuntimeEnvironment.getApplication()
         listOf("imports", "folder-imports").forEach { context.getSharedPreferences(it, 0).edit().clear().commit() }
         File(context.cacheDir, "import").deleteRecursively()
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         source = FakeDocuments()
         importer = AndroidAudioImporter(context, scope, inspect = { AudioMetadata(3000, date) },
@@ -86,6 +87,17 @@ class FolderImports117Test {
         folders = repository(); folders.scan(); folders.scan()
         assertNull(importer.next()); assertEquals(1, folders.state.value.folders.single().imported)
         assertArrayEquals(source.bytes.getValue(original.uri), source.bytes.values.first())
+    }
+
+    @Test fun newCallEntersQueueAfterTwoManualRefreshes209() = runBlocking {
+        folders.addHistory(tree, ImportKind.Call, FolderHistory.OnlyNew)
+        val call = source.file("通话.wav")
+        folders.scan()
+        assertNull(importer.next())
+        folders.scanNow()
+        withTimeout(5000) { importer.progress.first { it.queued == 1 } }
+        assertEquals(call.name, importer.next()!!.pending.info.displayName)
+        assertEquals(ImportKind.Call, importer.next()!!.kind)
     }
 
     @Test fun changingSizeAndRecentModificationWaitForTwoStableScans() = runBlocking {
@@ -178,7 +190,7 @@ class FolderImports117Test {
     @Test fun migrationFrom29PreservesDataAndAddsPersistentFingerprintTables() = runBlocking {
         val name = "folder117-migration.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/29.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/29.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { i ->
@@ -193,10 +205,10 @@ class FolderImports117Test {
             old.execSQL("INSERT INTO battery VALUES (1,1000,80,0)")
             old.version = 29
         }
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals(80, migrated.capture().batteries(0, 2000).first().single().percent)
             migrated.folderImports().remember(ImportFingerprint("3:abc", now))
             migrated.folderImports().observe(listOf(FolderObservation("root", "doc", 3, now, false)))

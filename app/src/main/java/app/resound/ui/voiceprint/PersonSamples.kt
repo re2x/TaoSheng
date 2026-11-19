@@ -1,6 +1,8 @@
 package app.resound.ui.voiceprint
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.*
+import app.resound.ui.theme.fade
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -36,8 +38,8 @@ private fun secondsText(ms: Long) = if (ms <= 0L) null else "%.1f 秒".format(ms
 /** 人物详情里的两块：此人的声纹样本（可听、可删），以及被认成此人的原话（可加入声纹、可移除） */
 @Composable
 internal fun PersonSamples(repo: VoiceprintRepository, person: VoiceprintPerson) {
-    val samples by remember(person.id) { repo.samples(person.id) }.collectAsState(null)
-    val lines by remember(person.id) { repo.lines(person.id) }.collectAsState(null)
+    val samples by remember(person.id) { repo.samples(person.id) }.collectAsStateWithLifecycle(null)
+    val lines by remember(person.id) { repo.lines(person.id) }.collectAsStateWithLifecycle(null)
     DisposableEffect(Unit) { onDispose { SamplePlayer.stop() } }
     SampleSection(repo, person, samples)
     LineSection(repo, person, lines)
@@ -96,7 +98,7 @@ private fun SampleRow(sample: VoiceprintSample, person: VoiceprintPerson, confir
         SampleState.Failed -> "未生效"
     }
     val meta = listOfNotNull(stamp(sample.at), secondsText(sample.millis)).joinToString(" · ")
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically) {
         PlayButton(sample, personColor(person), onPlay)
         Spacer(Modifier.width(12.dp))
@@ -126,7 +128,7 @@ private fun PlayButton(sample: VoiceprintSample, tint: Color, onClick: () -> Uni
     val bg by animateColorAsState(if (playing) tint else tint.copy(alpha = 0.14f), label = "bg")
     Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
         if (!sample.playable) {
-            Box(Modifier.size(34.dp).clip(CircleShape).background(c.separator.copy(alpha = 0.5f)), contentAlignment = Alignment.Center) {
+            Box(Modifier.size(34.dp).clip(CircleShape).background(c.separator.fade(0.5f)), contentAlignment = Alignment.Center) {
                 Text("—", style = RsType.subhead, color = c.textTertiary)
             }
         } else {
@@ -154,7 +156,7 @@ private fun LineSection(repo: VoiceprintRepository, person: VoiceprintPerson, li
         else -> Column(Modifier.animateContentSize(spring(stiffness = Spring.StiffnessMediumLow)), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             (if (expanded) lines else lines.take(FOLDED)).forEach { line ->
                 key(line.lineId) {
-                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.background).padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(c.fill).padding(horizontal = 14.dp, vertical = 10.dp)) {
                         Text("“${line.text}”", style = RsType.body, color = c.text, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         Spacer(Modifier.height(6.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {

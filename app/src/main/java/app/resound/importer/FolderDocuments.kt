@@ -1,5 +1,7 @@
 package app.resound.importer
 
+import app.resound.diagnostics.FailureNotes
+
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -17,6 +19,7 @@ internal interface FolderDocuments {
     fun root(tree: Uri): FolderDocument
     fun files(tree: Uri): List<FolderDocument>
     fun stat(uri: Uri): FolderDocument
+    fun metadata(document: FolderDocument): AudioMetadata = AudioMetadata(0, null)
     fun fingerprint(document: FolderDocument): String
 }
 
@@ -46,13 +49,23 @@ internal class AndroidFolderDocuments(private val context: Context) : FolderDocu
         return (top.filterNot { it.directory } + top.filter { it.directory }.flatMap { children(it.uri) })
             .filter { !it.directory && !it.hidden && ImportMedia.accepts(it.name, it.mime) }.distinctBy { it.uri }
     }
+    override fun metadata(document: FolderDocument): AudioMetadata {
+        val retriever = android.media.MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, document.uri)
+            AudioMetadata(retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0,
+                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE))
+        } finally { retriever.release() }
+    }
     override fun fingerprint(document: FolderDocument): String {
         // 本地文件只读首尾；管道或云盘 provider 不可 seek 时才流式读取。
         try {
             resolver.openFileDescriptor(document.uri, "r")?.let { descriptor ->
                 android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { return audioFingerprint(it.channel) }
             }
-        } catch (_: java.io.IOException) { /* 重新打开流，兼容不可 seek 的 provider。 */ }
+        } catch (caught: java.io.IOException) {
+            FailureNotes.record("importer/FolderDocuments.kt:55", caught)
+            /* 重新打开流，兼容不可 seek 的 provider。 */ }
         return resolver.openInputStream(document.uri)?.use(::audioFingerprint) ?: throw java.io.IOException("无法读取录音")
     }
 }

@@ -59,11 +59,11 @@ class ProblemReportsTest {
         context.getSharedPreferences("problem-reports", 0).edit().clear().commit()
         val crashes = CrashRecords(context)
         crashes.record(Thread.currentThread(), RuntimeException("不要导出"), 2000)
-        val database = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val database = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         try {
             val key = "sk-" + "secret".repeat(10)
             val hex = "abcdef12".repeat(4)
-            val stats = RoomCaptureStatsRepository(context, database.capture()) { "步骤=12 $key $hex" }
+            val stats = RoomCaptureStatsRepository(context, database.capture(), app.resound.platform.SystemZone) { "步骤=12 $key $hex" }
             val reports = LocalProblemReports(context, crashes, stats, updater, database.memory())
             context.getSharedPreferences("onboarding", 0).edit()
                 .putLong("count_wizard_shown", 2)

@@ -1,5 +1,7 @@
 package app.resound.diary
 
+import kotlinx.datetime.toKotlinLocalDate
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -39,16 +41,16 @@ class DayDiaryTest {
     @Before fun setup() {
         originalZone = TimeZone.getDefault()
         TimeZone.setDefault(TimeZone.getTimeZone("Asia/Shanghai"))
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val llm = LlmClient()
         val settings = AndroidDigestSettings(context, llm)
         val runner = DigestRunner(context, db.memory(), llm, settings, { "" }, { false })
-        memory = RoomMemoryRepository(db.memory(), runner, { error("禁止触发整理") }, scope)
+        memory = RoomMemoryRepository(db.memory(), runner, { error("禁止触发整理") }, scope, zoneProvider = app.resound.platform.ZoneProvider { java.time.ZoneId.systemDefault().id }, now = app.resound.platform.SystemNow, io = Dispatchers.IO)
         val reviews = RoomReviewRepository(db.review(), db.memory(), context.getSharedPreferences("review", 0), scope,
             { error("禁止读模型凭证") }, { _, _, _, _ -> error("禁止调用模型") }, { "" }, "回响",
-            object : Notifier { override suspend fun send(title: String, body: String, deepLink: String?, topic: app.resound.push.PushTopic?) { error("禁止推送") } }, {})
-        diary = LocalDiaryRepository(context, memory, reviews, db.memory())
+            object : Notifier { override suspend fun send(title: String, body: String, deepLink: String?, topic: app.resound.push.PushTopic?) { error("禁止推送") } }, {}, now = app.resound.platform.SystemNow::now, zone = java.time.ZoneId::systemDefault, io = kotlinx.coroutines.Dispatchers.IO)
+        diary = LocalDiaryRepository(context, memory, reviews, db.memory(), app.resound.platform.SystemZone, Dispatchers.IO)
     }
     @After fun close() = runBlocking {
         scope.coroutineContext[Job]!!.cancelAndJoin()
@@ -87,7 +89,7 @@ class DayDiaryTest {
     private suspend fun migrate(version: Int) {
         val name = "diary-migration-$version.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/$version.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/$version.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, 0, null).use { old ->
             val entities = schema.getJSONArray("entities")
             repeat(entities.length()) { index ->
@@ -106,10 +108,10 @@ class DayDiaryTest {
             }
             old.version = version
         }
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, migrated.testSql.version)
             assertEquals("/old", migrated.transcribe().segment(1).path)
             if (version == 9) {
                 val rows = migrated.memory().itemsByCategory(listOf("待办", "备忘")).first().associateBy { it.id }
@@ -174,7 +176,7 @@ class DayDiaryTest {
             item(4, "知识", created = start), item(5, created = end, due = end),
             item(6, status = "Ignored", created = start, due = start), item(7, created = start, event = 2),
             item(8, "备忘", created = start + 1)))
-        val groups = memory.dayItems(day).first()
+        val groups = memory.dayItems(day.toKotlinLocalDate()).first()
         assertEquals(listOf(1L, 8L), groups.mentioned.map { it.id })
         assertEquals(listOf(2L, 1L), groups.due.map { it.id })
         assertEquals(listOf(1L), groups.done.map { it.id })
@@ -187,7 +189,7 @@ class DayDiaryTest {
         event(3, at(LocalDate.parse("2026-11-01")))
         db.memory().insertItems(listOf(item(1, created = at(), due = at(date.plusDays(4))),
             item(2, created = at(date.plusDays(2)), event = 2), item(3, created = at(LocalDate.parse("2026-11-01")))))
-        assertEquals(setOf(date.minusDays(1), date), memory.activeDays(YearMonth.from(date)).first())
+        assertEquals(setOf(date.minusDays(1).toKotlinLocalDate(), date.toKotlinLocalDate()), memory.activeDays(kotlinx.datetime.YearMonth(date.year, date.monthValue)).first())
     }
 
     @Test fun markdownMatchesFullSampleSkipsMediaAndExportsWithoutInvokingModels() = runBlocking {
@@ -259,7 +261,7 @@ class DayDiaryTest {
         assertFalse(multi.contains("10月24日"))
         val meta = app.resound.transcribe.VoiceInputMetadata.json(app.resound.transcribe.VoiceInputMeta(
             "合成聊天", "synthetic.chat", "老王", "合成之前上下文", "合成之后回复")).toString()
-        db.openHelper.writableDatabase.execSQL("UPDATE transcript_lines SET voiceInputJson=? WHERE id=2", arrayOf(meta))
+        db.testSql.execSQL("UPDATE transcript_lines SET voiceInputJson=? WHERE id=2", arrayOf(meta))
         val full = diary.markdownWithContext(date, date, true, true)
         assertTrue(full.contains("**2026-10-23 14:05 我**：先确认需求"))
         assertTrue(full.contains("> 合成之前上下文")); assertTrue(full.contains("> 合成之后回复"))
@@ -267,4 +269,22 @@ class DayDiaryTest {
         assertTrue(without.contains("⌨ 语音输入 · 合成聊天 · 老王"))
         assertFalse(without.contains("合成之前上下文")); assertFalse(without.contains("合成之后回复"))
     }
+    @Test fun repository177CardsSettingsAndErrorsMatchOldImplementation() = runBlocking {
+        val fields = app.resound.skills.FieldType.entries.map { type -> app.resound.skills.SkillField(type.name.lowercase(), type.name, type, "") }
+        val value = app.resound.skills.FieldValue(text = "内容\n第二行", items = listOf("甲", "乙"),
+            quotes = listOf(app.resound.skills.CardQuote(1, "同事", at(hour = 23), "第一行\n第二行")),
+            number = 3.5, unit = "小时", checked = listOf(true), rating = 4)
+        val card = app.resound.skills.SkillCard(1, "meeting", "技能名", "meeting", date.toKotlinLocalDate(), at(hour = 23),
+            at(date.plusDays(1), 1), "卡片标题", "摘要", fields, fields.associate { it.key to value }, listOf(1), at(), true)
+        val out = mutableListOf(cardsMarkdown(listOf(card), ZoneId.of("Asia/Shanghai")), cardsMarkdown(emptyList(), ZoneId.of("UTC")))
+        context.getSharedPreferences("diary", 0).edit().putBoolean("cloudSync", true).commit()
+        // 使用旧方法输出；既有完整样例覆盖真实查询与文件导出。
+        out += "invalid=" + runCatching { diary.markdown(date, date.minusDays(1), true) }.exceptionOrNull()?.message
+        diary.setCloudSync(false)
+        out += "sync=${diary.cloudSync.value}/${context.getSharedPreferences("diary", 0).getBoolean("cloudSync", true)}"
+        val text = out.joinToString("\n", postfix = "\n")
+        val target = File("src/test/resources/repo177/LocalDiaryRepository/cards-settings.txt")
+        assertEquals(target.readText(), text)
+    }
+
 }

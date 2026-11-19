@@ -1,5 +1,10 @@
 package app.resound.location
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.data.CaptureDatabase
+
+import androidx.sqlite.execSQL
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -30,100 +35,15 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
-/** 一个定位点；只存手机本地。 */
-@Entity(tableName = "location_points", indices = [Index("at")])
-data class LocationPoint(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val at: Long,
-    val lat: Double,
-    val lng: Double,
-    val accuracy: Float,
-    val provider: String,
-)
-
-@Dao
-interface LocationDao {
-    @Insert suspend fun insert(point: LocationPoint): Long
-    @Query("SELECT * FROM location_points WHERE at >= :from AND at < :to ORDER BY at")
-    fun between(from: Long, to: Long): Flow<List<LocationPoint>>
-    @Query("SELECT * FROM location_points WHERE at >= :from AND at < :to ORDER BY at")
-    suspend fun betweenNow(from: Long, to: Long): List<LocationPoint>
-    @Query("SELECT * FROM location_points ORDER BY at DESC LIMIT 1")
-    suspend fun latest(): LocationPoint?
-    @Query("SELECT * FROM location_points ORDER BY at DESC LIMIT 1")
-    fun latestFlow(): Flow<LocationPoint?>
-    @Query("DELETE FROM location_points WHERE at >= :from AND at < :to")
-    suspend fun deleteBetween(from: Long, to: Long): Int
-}
-
-object LocationSchema {
-    fun create(db: androidx.sqlite.db.SupportSQLiteDatabase) {
-        db.execSQL("CREATE TABLE IF NOT EXISTS `location_points` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `at` INTEGER NOT NULL, `lat` REAL NOT NULL, `lng` REAL NOT NULL, `accuracy` REAL NOT NULL, `provider` TEXT NOT NULL)")
-        db.execSQL("CREATE INDEX IF NOT EXISTS `index_location_points_at` ON `location_points` (`at`)")
-    }
-}
-
-/** 一段停留：同一处（半径内）待够一定时间。 */
-data class Stay(val start: Long, val end: Long, val lat: Double, val lng: Double, val points: Int, val accuracy: Float) {
-    val minutes: Long get() = (end - start) / 60_000
-}
-
-data class DayTrack(val points: List<LocationPoint>, val stays: List<Stay>, val meters: Double)
-
 object Track {
-    const val STAY_RADIUS_M = 150.0
-    const val STAY_MIN_MS = 10 * 60_000L
-    /** 精度差于此值的点不参与计算（室内偶尔会飘到几公里外）。 */
-    const val MAX_ACCURACY_M = 200f
-    /** 两点相距小于此值视为原地抖动，不计入移动距离。 */
-    private const val JITTER_M = 30.0
-
-    fun meters(aLat: Double, aLng: Double, bLat: Double, bLng: Double): Double {
-        val r = 6_371_000.0
-        val dLat = Math.toRadians(bLat - aLat)
-        val dLng = Math.toRadians(bLng - aLng)
-        val h = sin(dLat / 2).pow(2) + cos(Math.toRadians(aLat)) * cos(Math.toRadians(bLat)) * sin(dLng / 2).pow(2)
-        return 2 * r * asin(sqrt(h.coerceIn(0.0, 1.0)))
-    }
-
-    fun day(all: List<LocationPoint>): DayTrack {
-        val points = all.filter { it.accuracy <= MAX_ACCURACY_M }.sortedBy { it.at }
-        return DayTrack(points, stays(points), distance(points))
-    }
-
-    /** 顺序聚类：点落在当前簇中心半径内就并入，否则另起一簇；时长够的簇算停留。 */
-    fun stays(points: List<LocationPoint>): List<Stay> {
-        val out = ArrayList<Stay>()
-        var cluster = ArrayList<LocationPoint>()
-        var cLat = 0.0; var cLng = 0.0
-        fun flush() {
-            if (cluster.size >= 2 && cluster.last().at - cluster.first().at >= STAY_MIN_MS)
-                out += Stay(cluster.first().at, cluster.last().at, cLat, cLng, cluster.size, cluster.minOf { it.accuracy })
-        }
-        for (p in points) {
-            if (cluster.isNotEmpty() && meters(cLat, cLng, p.lat, p.lng) <= STAY_RADIUS_M) {
-                cluster += p
-                cLat += (p.lat - cLat) / cluster.size; cLng += (p.lng - cLng) / cluster.size
-            } else {
-                flush()
-                cluster = arrayListOf(p); cLat = p.lat; cLng = p.lng
-            }
-        }
-        flush()
-        return out
-    }
-
-    fun distance(points: List<LocationPoint>): Double {
-        var total = 0.0
-        var last: LocationPoint? = null
-        for (p in points) {
-            val prev = last
-            if (prev == null) { last = p; continue }
-            val d = meters(prev.lat, prev.lng, p.lat, p.lng)
-            if (d >= JITTER_M) { total += d; last = p }
-        }
-        return total
-    }
+    private val rules = TrackRules(Math::toRadians)
+    const val STAY_RADIUS_M = TrackRules.STAY_RADIUS_M
+    const val STAY_MIN_MS = TrackRules.STAY_MIN_MS
+    const val MAX_ACCURACY_M = TrackRules.MAX_ACCURACY_M
+    fun meters(aLat: Double, aLng: Double, bLat: Double, bLng: Double) = rules.meters(aLat, aLng, bLat, bLng)
+    fun day(all: List<LocationPoint>) = rules.day(all)
+    fun stays(points: List<LocationPoint>) = rules.stays(points)
+    fun distance(points: List<LocationPoint>) = rules.distance(points)
 }
 
 /** 开关与权限状态。记录跟随收音前台服务进行。 */
@@ -136,7 +56,9 @@ class LocationSettings(context: Context) {
     fun hasForeground() = granted(Manifest.permission.ACCESS_FINE_LOCATION) || granted(Manifest.permission.ACCESS_COARSE_LOCATION)
     fun hasBackground() = granted(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
     /** 手机“位置信息”总开关；关着时有权限也拿不到任何位置。 */
-    fun systemEnabled() = runCatching { androidx.core.location.LocationManagerCompat.isLocationEnabled(app.getSystemService(android.location.LocationManager::class.java)) }.getOrDefault(true)
+    fun systemEnabled() = runCatching { androidx.core.location.LocationManagerCompat.isLocationEnabled(app.getSystemService(android.location.LocationManager::class.java)) }.onFailure {
+        FailureNotes.record("location/Location.kt:57", it)
+    }.getOrDefault(true)
     /** 开关打开且至少有前台定位权限时，收音服务才带上定位类型。 */
     fun wanted() = _enabled.value && hasForeground()
     private fun granted(p: String) = ContextCompat.checkSelfPermission(app, p) == PackageManager.PERMISSION_GRANTED
@@ -150,7 +72,9 @@ class LocationSettings(context: Context) {
     private val secrets by lazy { SecretStore(app, "location-secrets", "resound-location-aes-v1") }
     private val _hasAmapKey = MutableStateFlow(app.getSharedPreferences("location-secrets", Context.MODE_PRIVATE).contains("amap"))
     val hasAmapKey: StateFlow<Boolean> = _hasAmapKey
-    fun amapKey(): String = if (_hasAmapKey.value) runCatching { secrets.read("amap") }.getOrDefault("") else ""
+    fun amapKey(): String = if (_hasAmapKey.value) runCatching { secrets.read("amap") }.onFailure {
+        FailureNotes.record("location/Location.kt:71", it)
+    }.getOrDefault("") else ""
     fun setAmapKey(key: String?) {
         if (key.isNullOrBlank()) secrets.remove("amap") else secrets.write("amap", key.trim())
         _hasAmapKey.value = !key.isNullOrBlank()
@@ -172,7 +96,9 @@ class LocationTracker(context: Context, private val dao: LocationDao, private va
             if (!keep(lastSaved, point)) return
             lastSaved = point
         }
-        scope.launch(Dispatchers.IO) { runCatching { dao.insert(point) } }
+        scope.launch(Dispatchers.IO) { runCatching { dao.insert(point) }.onFailure {
+            FailureNotes.record("location/Location.kt:93", it)
+        } }
     }
     private val listener = LocationListener { save(it) }
     private var lastFixAsk = 0L
@@ -188,10 +114,14 @@ class LocationTracker(context: Context, private val dao: LocationDao, private va
         if (!granted || !androidx.core.location.LocationManagerCompat.isLocationEnabled(manager)) return
         val now = android.os.SystemClock.elapsedRealtime()
         synchronized(this) { if (!force && now - lastFixAsk < 30_000) return; lastFixAsk = now }
-        if (lastSaved == null) scope.launch(Dispatchers.IO) { lastSaved = lastSaved ?: runCatching { dao.latest() }.getOrNull() }
+        if (lastSaved == null) scope.launch(Dispatchers.IO) { lastSaved = lastSaved ?: runCatching { dao.latest() }.onFailure {
+            FailureNotes.record("location/Location.kt:109", it)
+        }.getOrNull() }
         val providers = manager.getProviders(true)
         try {
-            providers.mapNotNull { runCatching { manager.getLastKnownLocation(it) }.getOrNull() }
+            providers.mapNotNull { runCatching { manager.getLastKnownLocation(it) }.onFailure {
+                FailureNotes.record("location/Location.kt:112", it)
+            }.getOrNull() }
                 .filter { System.currentTimeMillis() - it.time < 2 * 60_000 }.minByOrNull { if (it.hasAccuracy()) it.accuracy else 999f }
                 ?.let(::save)
             val provider = when {
@@ -202,7 +132,9 @@ class LocationTracker(context: Context, private val dao: LocationDao, private va
             }
             androidx.core.location.LocationManagerCompat.getCurrentLocation(manager, provider, null as android.os.CancellationSignal?,
                 ContextCompat.getMainExecutor(app)) { loc -> loc?.let(::save) }
-        } catch (_: SecurityException) { }
+        } catch (caught: SecurityException) {
+            FailureNotes.record("location/Location.kt:123", caught)
+            }
     }
 
     @SuppressLint("MissingPermission")
@@ -256,7 +188,7 @@ class LocationRepository(val settings: LocationSettings, val tracker: LocationTr
     fun latest(): Flow<LocationPoint?> = dao.latestFlow()
 
     companion object {
-        fun create(context: Context, database: app.resound.data.CaptureDatabase, scope: CoroutineScope): LocationRepository {
+        fun create(context: Context, database: CaptureDatabase, scope: CoroutineScope): LocationRepository {
             val dao = database.location()
             val settings = LocationSettings(context)
             return LocationRepository(settings, LocationTracker(context, dao, scope), dao, PlaceResolver(context, database.places(), settings))

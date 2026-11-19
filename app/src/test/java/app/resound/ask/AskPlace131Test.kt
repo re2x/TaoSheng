@@ -1,5 +1,6 @@
 package app.resound.ask
 
+import app.resound.data.testSql
 import android.app.Application
 import androidx.room.Room
 import app.resound.data.CaptureDatabase
@@ -32,14 +33,14 @@ class AskPlace131Test {
 
     @Before fun setUp() {
         val context = RuntimeEnvironment.getApplication() as Application
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java)
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver())
             .addCallback(app.resound.search.SearchIndex.callback).allowMainThreadQueries().build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         location = LocationRepository.create(context, db, scope)
         location.settings.setEnabled(true)
         location.settings.setLookup(false)
         places = CachedAskPlaces(location, db, zone)
-        db.openHelper.writableDatabase.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(1,?,?, 'mic','/test',1,'Done')", arrayOf(at("00:00"), at("23:59")))
+        db.testSql.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(1,?,?, 'mic','/test',1,'Done')", arrayOf(at("00:00"), at("23:59")))
     }
 
     @After fun tearDown() { scope.cancel(); db.close() }
@@ -59,11 +60,11 @@ class AskPlace131Test {
         if (home) location.places.setManual(lat, 120.0, name, "", true)
     }
     private fun event(id: Int, start: String, end: String, title: String = "项目会议", starred: Int = 1, deleted: Int = 0) {
-        db.openHelper.writableDatabase.execSQL("""INSERT INTO memory_events(id,startAt,endAt,scene,title,summary,pointsJson,peopleJson,important,deleted,createdAt,model,starred)
+        db.testSql.execSQL("""INSERT INTO memory_events(id,startAt,endAt,scene,title,summary,pointsJson,peopleJson,important,deleted,createdAt,model,starred)
             VALUES(?,?,?,'会议',?,'项目安排','[]','[]',0,?,?,'fake',?)""", arrayOf(id, at(start), at(end), title, deleted, at(start), starred))
     }
     private fun line(id: Int, start: String, end: String, text: String = "明天提交项目方案", speaker: String = "我", event: Int? = null) {
-        db.openHelper.writableDatabase.execSQL("""INSERT INTO transcript_lines(id,segmentId,startAt,endAt,text,speakerName,eventId)
+        db.testSql.execSQL("""INSERT INTO transcript_lines(id,segmentId,startAt,endAt,text,speakerName,eventId)
             VALUES(?,1,?,?,?,?,?)""", arrayOf(id, at(start), at(end), text, speaker, event))
     }
 
@@ -148,7 +149,7 @@ class AskPlace131Test {
         val original = tools()
         val tool = AskPlaceTools(original, { error("不应读足迹开关") }, { _, _, _ -> error("不应查足迹") }, { _, _ -> error("不应查地点") })
         assertEquals(listOf(1L), ids(find("search_events", "{}", tool)))
-        val definitions = org.json.JSONArray(File("src/main/assets/prompts/ask-tools.json").readText())
+        val definitions = org.json.JSONArray(app.resound.ask.core.AskDefinitions.json())
         for (i in 0 until definitions.length()) {
             val f = definitions.getJSONObject(i).getJSONObject("function")
             if (f.getString("name") in setOf("search_events", "search_lines")) {

@@ -1,5 +1,8 @@
 package app.resound.recordings
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.scheduling.refreshWhileNeeded
 import android.content.*
 import android.net.Uri
 import android.provider.MediaStore
@@ -20,6 +23,7 @@ internal class AndroidRecordingPacker(
         OneTimeWorkRequestBuilder<RecordingPackWorker>().setInputData(workDataOf("id" to id)).build()); Unit },
     private val stop: (String) -> Unit = { WorkManager.getInstance(context).cancelUniqueWork("recording-pack-$it"); Unit },
     private val metadata: suspend (Boolean) -> List<RecordingSource> = { load() },
+    private val refreshDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : RecordingPacker {
     private val prefs = context.getSharedPreferences("recording-pack", Context.MODE_PRIVATE)
     private var entry = prefs.getString("job", null)?.let { JSONObject(it) }
@@ -31,7 +35,7 @@ internal class AndroidRecordingPacker(
     init {
         publish()
         entry?.takeIf { it.optString("state") == "running" }?.let { enqueue(it.getString("id")) }
-        scope.launch(Dispatchers.IO) { while (isActive) { refreshDays(); delay(30_000) } }
+        scope.launch(refreshDispatcher) { days.subscriptionCount.map { it > 0 }.refreshWhileNeeded(30_000) { refreshDays() } }
     }
     private suspend fun refreshDays() { days.value = metadata(false).filter { it.file.isFile }.map { it.day }.distinct().sortedDescending() }
     override suspend fun estimate(range: RecordingRange, options: RecordingPackOptions) = withContext(Dispatchers.IO) {
@@ -45,7 +49,9 @@ internal class AndroidRecordingPacker(
             .put("fromTime", range.fromTime.toString()).put("toTime", range.toTime.toString()).put("text", options.withText)
             .put("skip", options.skipMedia).put("state", "running")
         publish()
-        try { enqueue(id) } catch (_: Exception) { fail(id, "无法安排后台打包，请重试") }
+        try { enqueue(id) } catch (caught: Exception) {
+            FailureNotes.record("recordings/AndroidRecordingPacker.kt:50", caught)
+            fail(id, "无法安排后台打包，请重试") }
         return id
     }
     @Synchronized override fun cancel(id: String) {
@@ -56,7 +62,9 @@ internal class AndroidRecordingPacker(
     @Synchronized override fun shareUri(id: String): Uri? {
         val j = entry?.takeIf { it.optString("id") == id && it.optString("state") == "done" } ?: return null
         val uri = Uri.parse(j.getString("uri"))
-        return runCatching { context.contentResolver.openFileDescriptor(uri, "r")?.use { uri } }.getOrNull()
+        return runCatching { context.contentResolver.openFileDescriptor(uri, "r")?.use { uri } }.onFailure {
+            FailureNotes.record("recordings/AndroidRecordingPacker.kt:61", it)
+        }.getOrNull()
     }
     @Synchronized private fun running(id: String) = entry?.let { it.optString("id") == id && it.optString("state") == "running" } == true
     @Synchronized internal fun fail(id: String, message: String) {
@@ -119,7 +127,9 @@ internal class AndroidRecordingPacker(
             }
             true
         } catch (e: CancellationException) { throw e }
-        catch (_: Exception) { fail(id, "录音打包失败，请检查原声文件和剩余空间后重试"); false }
+        catch (caught: Exception) {
+            FailureNotes.record("recordings/AndroidRecordingPacker.kt:124", caught)
+            fail(id, "录音打包失败，请检查原声文件和剩余空间后重试"); false }
         finally { if (!done && uri != null) context.contentResolver.delete(uri!!, null, null) }
     } }
 }

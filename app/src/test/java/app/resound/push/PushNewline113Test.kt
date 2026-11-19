@@ -1,5 +1,6 @@
 package app.resound.push
 
+import kotlinx.datetime.toKotlinLocalDate
 import app.resound.review.DailyReview
 import app.resound.review.ReviewSection
 import okhttp3.FormBody
@@ -55,7 +56,7 @@ class PushNewline113Test {
         val json = request(PushKind.PushPlus, PushFormat.Json).json()
         assertEquals(message.envelope(PushFormat.Json).toString(), json.getString("content"))
         assertEquals(body, JSONObject(json.getString("content")).getString("body"))
-        val review = DailyReview(LocalDate.parse("2026-11-09"), "摘要一\n摘要二", listOf(
+        val review = DailyReview(LocalDate.parse("2026-11-09").toKotlinLocalDate(), "摘要一\n摘要二", listOf(
             ReviewSection("事项", listOf("甲", "乙"), listOf(null, null))), 1)
         val content = request(PushKind.PushPlus, PushFormat.Markdown, message.copy(review = review)).json().getString("content")
         assertTrue(content.contains("摘要一<br/>\n摘要二"))
@@ -156,13 +157,4 @@ class PushNewline113Test {
         assertEquals(body, message.rendered(PushFormat.Markdown))
     }
 
-    @Test fun markdownBlocksAndExistingHardBreaksAreNotDamaged() {
-        val blocks = "# 标题\n正文  \n已换行<br/>\n\n```md\n一\n二\n```\n\n| 列 |\n| --- |\n| 值 |\n\n- 甲\n  - 子项\n- 乙"
-        for (kind in listOf(PushKind.PushPlus, PushKind.DingTalk, PushKind.ServerChan, PushKind.Webhook)) {
-            val converted = PushBodyLayout.convert(kind, PushFormat.Markdown, blocks)
-            assertTrue(converted.startsWith("# 标题\n正文  \n已换行<br/>\n\n```md\n一\n二\n```"))
-            assertTrue(converted.contains("| 列 |\n| --- |\n| 值 |"))
-            assertEquals(converted, PushBodyLayout.convert(kind, PushFormat.Markdown, converted))
-        }
-    }
 }

@@ -1,5 +1,8 @@
 package app.resound.ui.importer
 
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.datetime.toKotlinLocalDate
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -14,7 +17,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,21 +59,49 @@ private fun length(ms: Long): String {
     return if (m < 60) "$m 分钟" else "${m / 60} 小时" + if (m % 60 > 0) " ${m % 60} 分" else ""
 }
 
-/** 时间线上的一行：“09:15 · 导入的会议 · 项目周会（1 小时 12 分）· 5 件事 ›” */
+/**
+ * 时间线上的一份导入录音，和其他事件卡同一个样子：
+ * 标题用纪要的标题（没有纪要就用整理出的第一件事），后面一个“导入·通话”小标签；
+ * 下面两行摘要；最后一行小字是文件名 · 时长 · 几件事。还没处理完时标题照旧、显示进度。
+ */
 @Composable
-internal fun ImportLine(r: ImportRecord, events: Int, onOpen: () -> Unit) {
+internal fun ImportLine(r: ImportRecord, events: List<MemoryEvent>, onOpen: () -> Unit) {
     val c = Rs.colors
-    Row(Modifier.fillMaxWidth().springClick(onOpen).padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(formatClock(r.startAt), style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = c.accent, modifier = Modifier.widthIn(min = 58.dp))
-        app.resound.ui.skills.SkillIcon(kindIcon(r.kind), 28.dp)
-        Spacer(Modifier.width(10.dp))
+    val day = remember(r.startAt) { java.time.Instant.ofEpochMilli(r.startAt).atZone(java.time.ZoneId.systemDefault()).toLocalDate() }
+    val skills = remember { app.resound.ui.skills.skillRepo() }
+    val card = if (r.cardId == null) null else remember(day) { skills.cards(day.toKotlinLocalDate()) }
+        .collectAsStateWithLifecycle(initialValue = emptyList()).value.firstOrNull { it.id == r.cardId }
+    val first = events.minByOrNull { it.startAt }
+    val kindName = r.kind.title.substringBefore(" ")
+    val done = r.status == ImportRecordStatus.Done
+    val title = (card?.title ?: first?.title)?.takeIf { done && it.isNotBlank() } ?: r.defaultTitle ?: "导入的$kindName"
+    val summary = (card?.summary ?: first?.summary)?.takeIf { done && it.isNotBlank() }
+    val ink = app.resound.ui.skills.skillInk(kindIcon(r.kind))
+    Row(Modifier.fillMaxWidth().springClick(onOpen).padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 12.dp)) {
+        Text(formatClock(r.startAt), style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = c.textSecondary,
+            modifier = Modifier.widthIn(min = 58.dp).padding(top = 1.dp))
         Column(Modifier.weight(1f)) {
-            Text("导入的${r.kind.title.substringBefore(" ")}", style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = app.resound.ui.skills.skillInk(kindIcon(r.kind)))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                app.resound.ui.skills.SkillIcon(kindIcon(r.kind), 20.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(title, style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                Spacer(Modifier.width(6.dp))
+                Text("导入·$kindName", style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = ink, maxLines = 1,
+                    modifier = Modifier.clip(androidx.compose.foundation.shape.CircleShape).background(ink.copy(alpha = 0.12f))
+                        .padding(horizontal = 7.dp, vertical = 1.dp))
+            }
+            if (summary != null) {
+                Spacer(Modifier.height(2.dp))
+                Text(summary, style = RsType.caption.copy(lineHeight = 18.sp), color = c.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+            Spacer(Modifier.height(3.dp))
             val st = statusText(r)
-            Text(listOfNotNull(r.fileName.substringBeforeLast('.'), length(r.endAt - r.startAt), st ?: if (events > 0) "$events 件事" else null).joinToString(" · "),
-                style = RsType.caption, color = if (r.status == ImportRecordStatus.Failed) c.critical else c.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(listOfNotNull(r.fileName.substringBeforeLast('.'), length(r.endAt - r.startAt), st ?: if (events.isNotEmpty()) "${events.size} 件事" else null)
+                .joinToString(" · "), style = RsType.caption, color = if (r.status == ImportRecordStatus.Failed) c.critical else c.textTertiary,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Text("›", style = RsType.title, color = c.textTertiary)
+        Text("›", style = RsType.title, color = c.textTertiary, modifier = Modifier.padding(start = 6.dp))
     }
 }
 
@@ -85,12 +115,12 @@ fun ImportRecordSheet(id: Long, onOpenEvent: (MemoryEvent) -> Unit, onDismiss: (
     val c = Rs.colors
     val context = LocalContext.current
     val kinds = AppGraph.importKinds
-    val r = remember(id) { kinds.record(id) }.collectAsState(initial = null).value ?: return
+    val r = remember(id) { kinds.record(id) }.collectAsStateWithLifecycle(initialValue = null).value ?: return
     val date = remember(r.startAt) { java.time.Instant.ofEpochMilli(r.startAt).atZone(java.time.ZoneId.systemDefault()).toLocalDate() }
     val skills = remember { app.resound.ui.skills.skillRepo() }
-    val cards by remember(date) { skills.cards(date) }.collectAsState(initial = emptyList())
-    val segments by remember(date) { AppGraph.transcripts.day(date) }.collectAsState(initial = emptyList())
-    val events = remember(date) { AppGraph.memory.events(date) }.collectAsState(initial = null).value.orEmpty()
+    val cards by remember(date) { skills.cards(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val segments by remember(date) { AppGraph.transcripts.day(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val events = remember(date) { AppGraph.memory.events(date.toKotlinLocalDate()) }.collectAsStateWithLifecycle(initialValue = null).value.orEmpty()
     var openedCard by remember { mutableStateOf<SkillCard?>(null) }
     val onOpenCard: (SkillCard) -> Unit = { openedCard = it }
     openedCard?.let { card -> app.resound.ui.skills.SkillCardSheet(card, skills) { openedCard = null } }
@@ -98,13 +128,16 @@ fun ImportRecordSheet(id: Long, onOpenEvent: (MemoryEvent) -> Unit, onDismiss: (
     val mine = events.filter { it.startAt >= r.startAt && it.startAt < r.endAt }.sortedBy { it.startAt }
     val lines = segments.filter { it.segmentId in r.segmentIds }.sortedBy { r.segmentIds.indexOf(it.segmentId) }.flatMap { it.lines }
     var changing by remember { mutableStateOf<ImportKind?>(null) }
-    RsSheet(r.fileName.substringBeforeLast('.'), "${r.kind.title} · ${formatClock(r.startAt)} 开始 · ${length(r.endAt - r.startAt)}" +
+    var exporting by remember(id) { mutableStateOf(false) }
+    if (exporting) app.resound.ui.transcript.ExportSheet(r.segmentIds,
+        app.resound.ui.transcript.safeName(r.fileName.substringBeforeLast('.'))) { exporting = false }
+    RsSheet(r.defaultTitle ?: r.fileName.substringBeforeLast('.'), "${r.kind.title} · ${formatClock(r.startAt)} 开始 · ${length(r.endAt - r.startAt)}" +
         (if (r.byChannel) " · 按左右声道分人" else ""), onDismiss = onDismiss) {
         val playingHere = (app.resound.ui.transcript.LinePlayer.source as? app.resound.ui.transcript.PlaySource.Import)?.recordId == r.id
         if (playingHere) app.resound.ui.transcript.InlinePlayer()
         statusText(r)?.let { Text(it + (r.error?.let { e -> "：$e" } ?: ""), style = RsType.subhead, color = if (r.status == ImportRecordStatus.Failed) c.critical else c.textSecondary) }
         // 纪要
-        if (r.kind != ImportKind.Normal) RsCard(color = c.background, padding = PaddingValues(16.dp)) {
+        if (r.kind != ImportKind.Normal) RsCard(color = c.fill, padding = PaddingValues(16.dp)) {
             if (card != null) Row(Modifier.fillMaxWidth().springClick { onOpenCard(card) }, verticalAlignment = Alignment.CenterVertically) {
                 app.resound.ui.skills.SkillIcon(card.icon, 36.dp)
                 Spacer(Modifier.width(12.dp))
@@ -120,10 +153,11 @@ fun ImportRecordSheet(id: Long, onOpenEvent: (MemoryEvent) -> Unit, onDismiss: (
         if (lines.isNotEmpty() && !playingHere) ActionButton("▶ 播放整段", ActionKind.Secondary) {
             app.resound.ui.transcript.LinePlayer.play(context, lines, 0, app.resound.ui.transcript.PlaySource.Import(r.id))
         }
+        if (r.segmentIds.isNotEmpty()) ActionButton("导出录音", ActionKind.Secondary) { exporting = true }
         // 整理出的事
         if (mine.isNotEmpty()) {
             Text("整理出的 ${mine.size} 件事", style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = c.textTertiary)
-            RsCard(color = c.background, padding = PaddingValues(vertical = 4.dp)) {
+            RsCard(color = c.fill, padding = PaddingValues(vertical = 4.dp)) {
                 mine.forEachIndexed { i, e ->
                     if (i > 0) androidx.compose.foundation.layout.Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(0.5.dp).background(c.separator))
                     Row(Modifier.fillMaxWidth().springClick { onOpenEvent(e) }.padding(horizontal = 16.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {

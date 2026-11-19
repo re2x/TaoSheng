@@ -1,5 +1,6 @@
 package app.resound.ui
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.runtime.remember
 import androidx.compose.animation.Crossfade
@@ -24,7 +25,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -66,7 +66,7 @@ fun AppShell(tabs: List<Pair<String, @Composable () -> Unit>>, request: Pair<Int
     var tab by rememberSaveable { mutableIntStateOf(0) }
     // 外部（如点通知）要求切到某一页；Long 用来区分同一页的多次请求
     androidx.compose.runtime.LaunchedEffect(request) { request?.let { tab = it.first } }
-    val navRequest by ShellNav.request.collectAsState()
+    val navRequest by ShellNav.request.collectAsStateWithLifecycle()
     androidx.compose.runtime.LaunchedEffect(navRequest) { navRequest?.let { tab = it.first } }
     val holder = rememberSaveableStateHolder()
     // 再点一下当前底栏图标的次数，按页记；页面拿到后回到顶部
@@ -151,8 +151,11 @@ private fun TabBar(labels: List<String>, selected: Int, onSelect: (Int) -> Unit,
         Row(Modifier.padding(5.dp)) {
             labels.forEachIndexed { i, label ->
                 val on = i == selected
-                val bg by animateColorAsState(if (on) c.accentSoft else c.accentSoft.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "tabBg")
-                val fg by animateColorAsState(if (on) c.accent else c.textSecondary, label = "tabFg")
+                // 夜间选中项：中性深灰底 + 橙字（小面积点缀）；日间保持暖橙
+                val onBg = if (c.isDark) c.trackThumb else c.accentSoft
+                val onFg = c.accent
+                val bg by animateColorAsState(if (on) onBg else onBg.copy(alpha = 0f), spring(stiffness = Spring.StiffnessMediumLow), label = "tabBg")
+                val fg by animateColorAsState(if (on) onFg else c.textSecondary, label = "tabFg")
                 Box(Modifier.clip(CircleShape).background(bg).springClick { onSelect(i) }.padding(horizontal = if (narrow) 9.dp else 13.dp, vertical = 10.dp)) {
                     Text(label, style = RsType.headline, color = fg, maxLines = 1, softWrap = false)
                 }

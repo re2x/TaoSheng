@@ -1,5 +1,7 @@
 package app.resound.transcribe
 
+import kotlinx.datetime.toKotlinLocalDate
+import app.resound.data.complete
 import android.app.Application
 import android.content.Context
 import androidx.work.*
@@ -38,34 +40,48 @@ class TranscribeSchedulerTest {
     }
     @After fun close() { manager.cancelAllWork().result.get(); WorkManagerTestInitHelper.closeWorkDatabase() }
     @Test fun playbackSkippedStaysOutOfQueueAndManualOverrideRequeues() = runBlocking {
-        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val audio = java.io.File.createTempFile("playback-test", ".ogg", context.cacheDir).apply { writeBytes(byteArrayOf(1)) }
         try {
             db.capture().segment(app.resound.data.SegmentEntity(id = 1, startAt = 1, endAt = 10_001, sourceId = "mic", path = audio.path, sizeBytes = 1,
                 status = "SkippedPlayback", completedAt = 10_001, playbackMillis = 9_000))
             assertTrue(db.transcribe().candidates(Long.MAX_VALUE).isEmpty())
-            assertEquals(1, db.transcribe().expired(10_001).size)
-            assertTrue(TranscribePolicy.canDelete("SkippedPlayback", 10_001, 10_001 + TranscribePolicy.RETENTION_MILLIS))
             val settings = Settings()
-            val repository = RoomTranscriptRepository(context, db.transcribe(), settings, TranscribeScheduler(context, settings), scope)
+            val repository = RoomTranscriptRepository(context, db.transcribe(), settings, TranscribeScheduler(context, settings), scope, app.resound.platform.SystemZone, app.resound.platform.SystemNow, Dispatchers.IO)
             repository.transcribeAnyway(1)
             withTimeout(3000) { db.transcribe().observeSegments().first { it.single().status == "Pending" } }
             assertEquals(1, db.transcribe().candidates(Long.MAX_VALUE).size)
             assertNull(db.transcribe().segment(1).completedAt)
             assertEquals(9_000L, db.transcribe().segment(1).playbackMillis)
             withTimeout(3000) { while (manager.getWorkInfosForUniqueWork(TranscribeScheduler.IMMEDIATE).get().isEmpty()) delay(20) }
+            assertEquals(1, db.transcribe().segment(1).playbackDigest)
             Unit
         } finally { scope.cancel(); db.close(); audio.delete() }
     }
+    @Test fun transcribeAnywayDigestTwoRequeuesAndWritesIntent() = runBlocking {
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val audio = java.io.File.createTempFile("playback-digest-two", ".ogg", context.cacheDir).apply { writeBytes(byteArrayOf(1)) }
+        try {
+            db.capture().segment(app.resound.data.SegmentEntity(id = 1, startAt = 1, endAt = 10_001, sourceId = "mic", path = audio.path, sizeBytes = 1,
+                status = "SkippedPlayback", completedAt = 10_001, playbackMillis = 9_000))
+            val settings = Settings()
+            val repository = RoomTranscriptRepository(context, db.transcribe(), settings, TranscribeScheduler(context, settings), scope, app.resound.platform.SystemZone, app.resound.platform.SystemNow, Dispatchers.IO)
+            repository.transcribeAnyway(1, 2)
+            withTimeout(3000) { db.transcribe().observeSegments().first { it.single().status == "Pending" } }
+            assertEquals(2, db.transcribe().segment(1).playbackDigest)
+            assertEquals(1, db.transcribe().candidates(Long.MAX_VALUE).size)
+        } finally { scope.cancel(); db.close(); audio.delete() }
+    }
     @Test fun repositoryPublishesAndResetsRealRoundProgress() = runBlocking {
-        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java)
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver())
             .allowMainThreadQueries().build()
         val job = SupervisorJob()
         val scope = CoroutineScope(job + Dispatchers.IO)
         try {
             val settings = Settings()
-            val repository = RoomTranscriptRepository(context, db.transcribe(), settings, TranscribeScheduler(context, settings), scope)
+            val repository = RoomTranscriptRepository(context, db.transcribe(), settings, TranscribeScheduler(context, settings), scope, app.resound.platform.SystemZone, app.resound.platform.SystemNow, Dispatchers.IO)
             repository.updateProgress(3, 1)
             withTimeout(3000) { repository.queue.first { it.runTotal == 3 && it.runDone == 1 } }
             repository.updateState(1000, "测试错误")
@@ -80,21 +96,21 @@ class TranscribeSchedulerTest {
         val settings=AndroidTranscribeSettings(context)
         settings.setSource(TranscribeSource.Local)
         TranscribeScheduler(context,settings).schedule()
-        assertEquals(NetworkType.NOT_REQUIRED,manager.getWorkInfosForUniqueWork(TranscribeScheduler.PERIODIC).get().single().constraints.requiredNetworkType)
+        assertEquals(NetworkType.NOT_REQUIRED,manager.getWorkInfosForUniqueWork(TranscribeScheduler.PIPELINE_PERIODIC).get().single().constraints.requiredNetworkType)
     }
-    @Test fun periodicScheduleUsesIntervalAndUnmeteredAndUpdatesSameWork() {
+    @Test fun periodicOpportunityIsFifteenMinutesAndIndependentOfNetworkSettings() {
         val settings = Settings()
         val scheduler = TranscribeScheduler(context, settings)
         val before = System.currentTimeMillis()
         scheduler.schedule()
-        val first = manager.getWorkInfosForUniqueWork(TranscribeScheduler.PERIODIC).get().single()
-        assertEquals(NetworkType.UNMETERED, first.constraints.requiredNetworkType)
-        assertTrue(first.nextScheduleTimeMillis >= before + 30 * 60_000)
+        val first = manager.getWorkInfosForUniqueWork(TranscribeScheduler.PIPELINE_PERIODIC).get().single()
+        assertEquals(NetworkType.NOT_REQUIRED, first.constraints.requiredNetworkType)
+        assertTrue(first.nextScheduleTimeMillis >= before + 15 * 60_000)
         settings.setIntervalMinutes(45); settings.setWifiOnly(false); scheduler.schedule()
-        val next = manager.getWorkInfosForUniqueWork(TranscribeScheduler.PERIODIC).get().single()
+        val next = manager.getWorkInfosForUniqueWork(TranscribeScheduler.PIPELINE_PERIODIC).get().single()
         assertEquals(first.id, next.id)
-        assertEquals(NetworkType.CONNECTED, next.constraints.requiredNetworkType)
-        assertEquals(45 * 60_000L, next.periodicityInfo!!.repeatIntervalMillis)
+        assertEquals(NetworkType.NOT_REQUIRED, next.constraints.requiredNetworkType)
+        assertEquals(15 * 60_000L, next.periodicityInfo!!.repeatIntervalMillis)
     }
     @Test fun immediateWorkIsUniqueAndReconfiguresQueuedConstraints() = runBlocking {
         val settings = Settings()
@@ -117,7 +133,7 @@ class TranscribeSchedulerTest {
         assertEquals(first.id, manager.getWorkInfosForUniqueWork(TranscribeScheduler.IMMEDIATE).get().single().id)
     }
     @Test fun diagnosticsContainOnlyAttemptMetadataAndQueueCounts() = runBlocking {
-        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java)
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(context, app.resound.data.CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver())
             .allowMainThreadQueries().build()
         val settings = Settings().apply { saveKey("synthetic-key") }
         val job = SupervisorJob()
@@ -133,7 +149,7 @@ class TranscribeSchedulerTest {
             repeat(25) { dao.attempt(app.resound.data.AsrAttemptEntity(segmentId = row.id, at = it.toLong(),
                 result = "Done", errorType = null, elapsedMillis = 300, sentMillis = 3000, logId = "safe-log")) }
             dao.reserveAudio(java.time.LocalDate.now().toString(), 3000, row.id)
-            val repository = RoomTranscriptRepository(context, dao, settings, scheduler, scope)
+            val repository = RoomTranscriptRepository(context, dao, settings, scheduler, scope, app.resound.platform.SystemZone, app.resound.platform.SystemNow, Dispatchers.IO)
             withTimeout(3000) { repository.queue.first { it.usedSecondsToday == 3L } }
             val output = repository.diagnostics()
             assertEquals(20, output.lines().count { it.startsWith("转写元数据") })
@@ -141,9 +157,28 @@ class TranscribeSchedulerTest {
             assertTrue(output.contains("elapsedMillis=300"))
             assertFalse(output.contains("不应导出的原话"))
             assertFalse(output.contains("synthetic-key"))
-            assertEquals("不应导出的原话", repository.day(java.time.Instant.ofEpochMilli(1).atZone(java.time.ZoneId.systemDefault()).toLocalDate()).first().single().lines.single().text)
-            assertFalse(repository.day(java.time.Instant.ofEpochMilli(1).atZone(java.time.ZoneId.systemDefault()).toLocalDate()).first().single().audioAvailable)
+            assertEquals("不应导出的原话", repository.day(java.time.Instant.ofEpochMilli(1).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toKotlinLocalDate()).first().single().lines.single().text)
+            assertFalse(repository.day(java.time.Instant.ofEpochMilli(1).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toKotlinLocalDate()).first().single().audioAvailable)
         } finally { job.cancelAndJoin(); db.close() }
+    }
+
+    @Test fun upgradeCancelsThreeLegacyNamesAndKeepsOneFallback() {
+        val legacyModes = mapOf(TranscribeScheduler.PERIODIC to TranscribeWork.MODE_TRANSCRIBE,
+            TranscribeScheduler.DIGEST_PERIODIC to TranscribeWork.MODE_DIGEST,
+            TranscribeScheduler.TIMED_GUARD to TranscribeWork.MODE_TIMED)
+        for ((name, mode) in legacyModes) {
+            manager.enqueueUniquePeriodicWork(name, ExistingPeriodicWorkPolicy.KEEP,
+                PeriodicWorkRequestBuilder<TranscribeWork>(15, java.util.concurrent.TimeUnit.MINUTES)
+                    .setInputData(workDataOf(TranscribeWork.MODE to mode, "periodic188" to true))
+                    .setInitialDelay(15, java.util.concurrent.TimeUnit.MINUTES).build()).result.get()
+        }
+        val scheduler = TranscribeScheduler(context, Settings())
+        scheduler.schedule(); scheduler.scheduleDigest()
+        for (name in legacyModes.keys) assertTrue(manager.getWorkInfosForUniqueWork(name).get().all { it.state.isFinished })
+        val fallback = manager.getWorkInfosForUniqueWork(TranscribeScheduler.PIPELINE_PERIODIC).get().single()
+        assertFalse(fallback.state.isFinished)
+        assertEquals(15 * 60_000L, fallback.periodicityInfo!!.repeatIntervalMillis)
+        assertEquals(NetworkType.NOT_REQUIRED, fallback.constraints.requiredNetworkType)
     }
 
 }

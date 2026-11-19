@@ -1,5 +1,6 @@
 package app.resound
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
@@ -22,7 +23,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.setValue
 import app.resound.capture.CaptureState
 import app.resound.ui.AppShell
@@ -33,6 +33,7 @@ import app.resound.ui.ask.AskScreen
 import app.resound.ui.preview.FakeAskRepository
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.Modifier
+import app.resound.ui.settings.settingsAnchor
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Box
 import app.resound.ui.voiceprint.VoiceprintCard
@@ -74,6 +75,24 @@ class MainActivity : ComponentActivity() {
         // 点“重做完成”通知：打开结果面板（可撤销）
         intent?.getStringExtra(app.resound.redo.EXTRA_REDO_JOB)?.let { app.resound.ui.redo.RedoUi.openJob = it }
         lifecycleScope.launch { receiveSharedAudio(intent) }
+        // 卡 147/148：长按快捷开关。专题开关 → 进行中打开那场专题，否则打开“开始专题”（上次的类型）；聆听开关 → 录音与后台页
+        if (intent?.action == "android.service.quicksettings.action.QS_TILE_PREFERENCES") {
+            @Suppress("DEPRECATION")
+            val tile = intent.getParcelableExtra<android.content.ComponentName>(Intent.EXTRA_COMPONENT_NAME)?.className.orEmpty()
+            if (tile.endsWith("ClassModeTileService")) {
+                tabRequest = 0 to System.nanoTime()
+                val current = if (AppGraph.isTopicsReady) AppGraph.topics.current.value else null
+                if (current != null) app.resound.ui.topic.TopicUi.openTopic = current.id
+                else app.resound.ui.topic.TopicUi.starting = if (AppGraph.isQuickPrefsReady) AppGraph.quickPrefs.lastTopicKind.value else app.resound.topic.TopicKind.Meeting
+            } else app.resound.ui.ShellNav.openSettings(SettingsPage.Capture)
+            return
+        }
+        // 卡 203：起床后“要记一下梦吗？”通知 → 回到今天并打开记梦
+        if (intent?.action == "app.resound.action.RECORD_DREAM") {
+            intent.getLongExtra("nightId", 0L).takeIf { it > 0 }?.let { app.resound.ui.night.NightUi.dreamNight = it }
+            tabRequest = 0 to System.nanoTime()
+            return
+        }
         if (intent?.getStringExtra("open") == "deleteRecent") {
             _privacyRequest.value = "deleteRecent"
             return
@@ -130,7 +149,13 @@ class MainActivity : ComponentActivity() {
                     mode = it
                     prefs.edit().putString("theme", it.name).apply()
                 }
-                val privacy by privacyRequest.collectAsState()
+                val reviewAsk by app.resound.ui.ShellNav.reviewRequest.collectAsStateWithLifecycle()
+                LaunchedEffect(reviewAsk) {
+                    val day = reviewAsk ?: return@LaunchedEffect
+                    dayOnly = false; openReview = day; tabRequest = 2 to System.nanoTime()
+                    app.resound.ui.ShellNav.reviewRequest.value = null
+                }
+                val privacy by privacyRequest.collectAsStateWithLifecycle()
                 LaunchedEffect(privacy) {
                     if (privacy == "deleteRecent") {
                         app.resound.ui.ShellNav.forgetRecent.value = true
@@ -168,22 +193,31 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
                                     }
-                                    SettingsPage.Capture -> VerifyScreen(capture, stats, setup, mode, setMode)
+                                    SettingsPage.Capture -> VerifyScreen(capture, stats, setup, bottom)
+                                    SettingsPage.Devices -> app.resound.ui.verify.DevicesPage(bottom)
+                                    SettingsPage.Advanced -> app.resound.ui.verify.AdvancedPage(stats, bottom)
                                     SettingsPage.Transcript -> TranscriptScreen(transcripts, transcribeSettings, bottom)
-                                    SettingsPage.Model -> Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = bottom + 24.dp),
+                                    SettingsPage.Model -> Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottom + 24.dp),
                                         verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                        if (AppGraph.isLlmProvidersReady) app.resound.ui.settings.ProvidersCard(AppGraph.llmProviders) else ModelCard(digestSettings) {}
-                                        (digestSettings as? app.resound.digest.AndroidDigestSettings)?.let { app.resound.ui.settings.DigestTimingCard(it) }
+                                        Box(Modifier.settingsAnchor("providers", "balance", "failover")) {
+                                            if (AppGraph.isLlmProvidersReady) app.resound.ui.settings.ProvidersCard(AppGraph.llmProviders) else ModelCard(digestSettings) {}
+                                        }
+                                        (digestSettings as? app.resound.digest.AndroidDigestSettings)?.let {
+                                            Box(Modifier.settingsAnchor("digest-timing", "conversation-gap", "thinking", "context")) { app.resound.ui.settings.DigestTimingCard(it) }
+                                        }
                                         // 余额已并入服务商卡片；没有服务商列表时仍用单独的余额卡
                                         if (!AppGraph.isLlmProvidersReady && AppGraph.isLlmBalanceReady) (digestSettings as? app.resound.digest.AndroidDigestSettings)?.let { app.resound.ui.settings.BalanceCard(AppGraph.llmBalance, it) }
                                         if (AppGraph.isUsageReady) app.resound.ui.settings.LlmUsageCard(AppGraph.usage)
                                     }
-                                    SettingsPage.Voiceprint -> LocalVoiceprint.current?.let { Box(Modifier.verticalScroll(rememberScrollState()).padding(16.dp)) { VoiceprintCard(it) } }
+                                    // 底部要给底栏留空，否则内容长了最后几行被挡住
+                                    SettingsPage.Voiceprint -> LocalVoiceprint.current?.let { Box(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottom + 24.dp)) { VoiceprintCard(it) } }
                                     SettingsPage.Prompts -> if (AppGraph.isPromptsReady) app.resound.ui.settings.PromptsPage(AppGraph.prompts, bottom)
                                     SettingsPage.Hotwords -> if (AppGraph.isHotwordsReady)
                                         Box(Modifier.verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = bottom + 24.dp)) { app.resound.ui.transcript.HotwordCard(AppGraph.hotwords) }
                                     SettingsPage.EnvSound -> if (AppGraph.isEnvSoundReady) app.resound.ui.envsound.EnvSoundPage(AppGraph.envSound, bottom)
                                     SettingsPage.Location -> if (AppGraph.isLocationReady) app.resound.ui.location.LocationPage(AppGraph.location, bottom)
+                                    SettingsPage.ScreenTime -> if (AppGraph.isScreenTimeReady) app.resound.ui.screentime.ScreenTimePage(AppGraph.screenTimeSettings, bottom)
+                                    SettingsPage.Night -> if (AppGraph.isNightReady) app.resound.ui.night.NightSettingsPage(bottom)
                                     SettingsPage.Push -> if (AppGraph.isPushReady) app.resound.ui.settings.PushPage(AppGraph.push, bottom)
                                     SettingsPage.Review -> if (AppGraph.isReviewReady) ReviewSettingsPage(AppGraph.review, bottom)
                                     SettingsPage.Backup -> if (AppGraph.isBackupReady) BackupPage(AppGraph.backup, bottom)
@@ -199,7 +233,7 @@ class MainActivity : ComponentActivity() {
                 app.resound.ui.importer.ImportHost()
                 openCardId?.let { id ->
                     val repo = remember { app.resound.ui.skills.skillRepo() }
-                    val card by remember(id) { repo.card(id) }.collectAsState(initial = null)
+                    val card by remember(id) { repo.card(id) }.collectAsStateWithLifecycle(initialValue = null)
                     card?.let { app.resound.ui.skills.SkillCardSheet(it, repo) { openCardId = null } }
                 }
                 }

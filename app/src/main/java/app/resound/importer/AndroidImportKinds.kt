@@ -1,5 +1,10 @@
 package app.resound.importer
 
+import app.resound.diagnostics.FailureNotes
+
+import app.resound.R
+import app.resound.usage.UsagePurpose
+
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -14,6 +19,7 @@ import app.resound.transcribe.TranscribeSource
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.time.LocalDate
+import kotlinx.datetime.toJavaLocalDate
 import java.util.concurrent.TimeUnit
 
 class AndroidImportKinds internal constructor(
@@ -25,17 +31,15 @@ class AndroidImportKinds internal constructor(
     private val transcribe: () -> Unit,
 ) : ImportKinds {
     private val prefs = context.getSharedPreferences("import-kinds", Context.MODE_PRIVATE)
-    private val last = MutableStateFlow(prefs.getString("last", null)?.let { runCatching { ImportKind.valueOf(it) }.getOrNull() })
+    private val last = MutableStateFlow(prefs.getString("last", null)?.let { runCatching { ImportKind.valueOf(it) }.onFailure {
+        FailureNotes.record("importer/AndroidImportKinds.kt:32", it)
+    }.getOrNull() })
     override val lastKind = last.asStateFlow()
     init {
         scope.launch(Dispatchers.IO) {
             // 查询关系表会同时观察转写/认人状态；进程重启也恢复 Summarizing。
             enqueue(context)
-            db.imports().observe().map { rows -> rows.filter { group ->
-                val row = group.row
-                row.ingestComplete && row.summaryRequested && row.status != "Summarizing" &&
-                    group.segments.none { it.status in setOf("Pending", "Running") || (it.status == "Done" && it.voiceprintProcessedAt == null) }
-            }.map { group -> Triple(group.row.id, group.row.revision, group.segments.map { it.status }) } }
+            db.imports().observeSummaryReady()
                 .distinctUntilChanged().collect { if (it.isNotEmpty()) enqueue(context) }
         }
     }
@@ -60,10 +64,17 @@ class AndroidImportKinds internal constructor(
         check(prefs.edit().putString("last", kind.name).commit()); last.value = kind
         importer.startBatch(ImportKindPolicy.batch(files, merge), asr, kind)
     }
-    override fun records(date: LocalDate): Flow<List<ImportRecord>> = db.imports().day(
-        date.atStartOfDay(SKILL_ZONE).toInstant().toEpochMilli(), date.plusDays(1).atStartOfDay(SKILL_ZONE).toInstant().toEpochMilli()
-    ).map { rows -> rows.map { it.record() } }
-    override fun record(id: Long): Flow<ImportRecord?> = db.imports().observe(id).map { it?.record() }
+    private fun presented(source: Flow<List<ImportRecordWithSegments>>) = combine(source, db.folderRecordings().observe()) { records, files ->
+        records.map { record ->
+            val file = files.firstOrNull { it.importRecordId == record.row.id }
+            val display = file?.let { it.partyName ?: it.number }
+            record.record().copy(defaultTitle=if (record.row.kind == "Call" && display != null) "和 $display 通话" else null)
+        }
+    }
+    override fun records(date: kotlinx.datetime.LocalDate): Flow<List<ImportRecord>> = presented(db.imports().day(
+        date.toJavaLocalDate().atStartOfDay(SKILL_ZONE(date.toJavaLocalDate())).toInstant().toEpochMilli(), date.toJavaLocalDate().plusDays(1).atStartOfDay(SKILL_ZONE(date.toJavaLocalDate())).toInstant().toEpochMilli()
+    ))
+    override fun record(id: Long): Flow<ImportRecord?> = presented(db.imports().observe(id).map { listOfNotNull(it) }).map { it.firstOrNull() }
     override fun changeKind(recordId: Long, kind: ImportKind) {
         scope.launch(Dispatchers.IO) { engine.change(recordId, kind); transcribe(); enqueue(context) }
     }
@@ -82,11 +93,11 @@ class AndroidImportKinds internal constructor(
                 val id = "import_${kind.name.lowercase()}"
                 SkillJson.parse(context.assets.open("skills/$id/skill.json").bufferedReader().use { it.readText() }, SkillOrigin.Builtin).skill to
                     context.assets.open("skills/$id/prompt.md").bufferedReader().use { it.readText() }
-            }, request = { system, user ->
+            }, callName = { id -> callPromptName(db,id) }, request = { system, user ->
                 val (preset, key) = settings.skillCredentials(null)
                 if (key.isBlank() && !settings.canUseWithoutKey(preset) && !settings.failover.hasBackup(preset)) throw LlmException(LlmError.Auth)
-                val reply = settings.failover.request("导入纪要", db.memory(), app.resound.usage.UsagePurpose.Skill, llm::chatJson)(preset, key, system, user)
-                withContext(NonCancellable) { db.memory().addUsage(LocalDate.now().toString(), reply.promptTokens, reply.completionTokens, app.resound.usage.UsagePurpose.Skill) }
+                val reply = settings.failover.request("导入纪要", db.memory(), UsagePurpose.Skill, llm::chatJson)(preset, key, system, user)
+                withContext(NonCancellable) { db.memory().addUsage(LocalDate.now().toString(), reply.promptTokens, reply.completionTokens, UsagePurpose.Skill) }
                 reply
             })
             return AndroidImportKinds(context, db, importer, scope,
@@ -100,14 +111,18 @@ class ImportSummaryWork(context: Context, params: WorkerParameters) : CoroutineW
         applicationContext.getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("import", "导入录音", NotificationManager.IMPORTANCE_LOW))
         return ForegroundInfo(3077, NotificationCompat.Builder(applicationContext, "import")
-            .setSmallIcon(app.resound.R.drawable.ic_notify).setContentTitle("正在整理导入录音").setOngoing(true).build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            .setSmallIcon(R.drawable.ic_notify).setContentTitle("正在整理导入录音").setOngoing(true).build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
-            try { setForeground(getForegroundInfo()) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* 前台受限时仍可用普通 Worker。 */ }
+            try { setForeground(getForegroundInfo()) } catch (e: CancellationException) { throw e } catch (caught: Exception) {
+                FailureNotes.record("importer/AndroidImportKinds.kt:107", caught)
+                /* 前台受限时仍可用普通 Worker。 */ }
             (AppGraph.importKinds as AndroidImportKinds).engine.run()
             Result.success()
         } catch (e: CancellationException) { throw e }
-        catch (_: Exception) { Result.retry() }
+        catch (caught: Exception) {
+            FailureNotes.record("importer/AndroidImportKinds.kt:111", caught)
+            Result.retry() }
     }
 }

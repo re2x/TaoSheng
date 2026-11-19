@@ -1,5 +1,6 @@
 package app.resound.transcribe
 
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
@@ -24,7 +25,7 @@ class TranscribePersistenceTest {
     private val created = mutableListOf<File>()
     @Before fun setup() {
         context = RuntimeEnvironment.getApplication()
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         dao = db.transcribe()
     }
     @After fun close() { db.close(); created.forEach { it.delete() } }
@@ -114,7 +115,7 @@ class TranscribePersistenceTest {
     @Test fun migrationPreservesOldRowsAndRoomValidatesWholeSchema() = runBlocking {
         val name = "migration-003.db"
         context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/1.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/1.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, Context.MODE_PRIVATE, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -131,10 +132,10 @@ class TranscribePersistenceTest {
             old.execSQL("INSERT INTO battery VALUES (1,1000,80,0)")
             old.version = 1
         }
-        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries()
+        val migrated = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            val writable = migrated.openHelper.writableDatabase // Room 逐表、列、索引和外键校验真实迁移。
+            val writable = migrated.testSql // Room 逐表、列、索引和外键校验真实迁移。
             val segment = migrated.transcribe().segment(7)
             assertEquals("Pending", segment.status)
             assertEquals("/old/audio.ogg", segment.path)
@@ -218,8 +219,8 @@ class TranscribePersistenceTest {
         assertEquals("Pending", dao.segment(second.id).status)
         assertEquals(0, dao.segment(second.id).attempts)
     }
-    @Test fun cleanupDeletesOnlySuccessfulAudioAfterFullDayIncludingEmpty() = runBlocking {
-        val day = TranscribePolicy.RETENTION_MILLIS
+    @Test fun runnerDoesNotDeleteCompletedAudioAfterFullDay() = runBlocking {
+        val day = 86_400_000L
         val done = insert(1, "Done", complete = 100)
         val empty = insert(2, "Empty", complete = 100)
         val recent = insert(3, "Done", complete = 101)
@@ -229,7 +230,7 @@ class TranscribePersistenceTest {
         var error: String? = null
         val runner = TranscribeRunner(dao, provider { _, _ -> error("不应联网") }, { "" }, { _, message -> error = message }, now = { day + 100 }, ready = { false })
         runner.run()
-        assertFalse(File(done.path).exists()); assertFalse(File(empty.path).exists())
+        assertTrue(File(done.path).exists()); assertTrue(File(empty.path).exists())
         for (row in listOf(recent, pending, failed, running)) assertTrue(File(row.path).exists())
         assertEquals("Done", dao.segment(done.id).status)
         assertEquals("Failed", dao.segment(running.id).status)

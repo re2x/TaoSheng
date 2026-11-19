@@ -13,7 +13,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-/** 回响的配色：浅灰白底 + 白卡片 + 暖橙点缀；夜间为暖调深灰，暖橙调柔和。 */
+/**
+ * 涛声的配色：日间浅灰白底 + 白卡片 + 暖橙点缀。
+ * 夜间（11-12 重做）：纯黑底（OLED 不发光）+ 中性深灰卡片加极细白边；文字只用一种白，按透明度分三档；
+ * 橙色只做小面积点缀。越“浮”起来的东西越亮：底 < 卡片 < 面板。
+ */
 @Immutable
 data class RsColors(
     val background: Color,
@@ -29,6 +33,26 @@ data class RsColors(
     val warning: Color,
     val critical: Color,
     val shadow: Color,
+    /** 弹出面板、提示条的底色（比卡片再亮一级）；日间同卡片 */
+    val elevated: Color,
+    /** 按钮、输入框、小胶囊的填充色（放在卡片或面板上）；日间同页面底色，夜间是半透明白，在任何深色层上都稍亮一点 */
+    val fill: Color,
+    /** 铺在主题色上的文字 / 图标颜色：日间主题色是橙，配白字；夜间主题色是近白，配深色字 */
+    val onAccent: Color,
+    /** 选中状态的底色（筛选胶囊、分段、日历选中日等）：日间同主题橙；夜间浅灰，把白色留给主要按钮 */
+    val selected: Color,
+    /** 选中状态上的文字 */
+    val onSelected: Color,
+    /** 分段切换器的底条；日间是浅灰，夜间是半透明白（不能用分隔线色改透明度，夜间分隔线本身就是半透明的） */
+    val track: Color,
+    /** 分段切换器选中的那一格；日间白色，夜间比底条亮一级 */
+    val trackThumb: Color,
+    /** 卡片描边；日间透明（靠阴影），夜间是极细的白边 */
+    val hairline: Color,
+    /** 主要按钮（整行大按钮）的底色：日间同主题橙；夜间是略灰的白，大块橙色在纯黑屏上太抢 */
+    val primary: Color,
+    /** 主要按钮上的文字 */
+    val onPrimary: Color,
     val isDark: Boolean,
 )
 
@@ -38,7 +62,7 @@ val LightRs = RsColors(
     cardPressed = Color(0xFFF7F4F0),
     text = Color(0xFF1D1B19),
     textSecondary = Color(0xFF7D7770),
-    textTertiary = Color(0xFFADA79F),
+    textTertiary = Color(0xFF8A847C),
     separator = Color(0xFFECE8E3),
     accent = Color(0xFFF07B2E),
     accentSoft = Color(0xFFFDEBDD),
@@ -46,23 +70,46 @@ val LightRs = RsColors(
     warning = Color(0xFFE6A23C),
     critical = Color(0xFFE5484D),
     shadow = Color(0x14583A1C),
+    elevated = Color(0xFFFFFFFF),
+    fill = Color(0xFFF4F2EF),
+    onAccent = Color(0xFFFFFFFF),
+    selected = Color(0xFFF07B2E),
+    onSelected = Color(0xFFFFFFFF),
+    track = Color(0xB3ECE8E3),
+    trackThumb = Color(0xFFFFFFFF),
+    hairline = Color(0x00000000),
+    primary = Color(0xFFF07B2E),
+    onPrimary = Color(0xFFFFFFFF),
     isDark = false,
 )
 
 val DarkRs = RsColors(
-    background = Color(0xFF171513),
-    card = Color(0xFF24211E),
-    cardPressed = Color(0xFF2C2825),
-    text = Color(0xFFF3EFEA),
-    textSecondary = Color(0xFFA39C94),
-    textTertiary = Color(0xFF6E6862),
-    separator = Color(0xFF33302C),
-    accent = Color(0xFFF59A5B),
-    accentSoft = Color(0xFF3A2A1E),
-    good = Color(0xFF5BC27A),
-    warning = Color(0xFFEDB75E),
-    critical = Color(0xFFF07175),
+    background = Color(0xFF000000),
+    card = Color(0xFF1C1C1E),
+    cardPressed = Color(0xFF2C2C2E),
+    text = Color(0xEBFFFFFF),          // 白 92%
+    textSecondary = Color(0x99FFFFFF), // 白 60%
+    textTertiary = Color(0x7AFFFFFF),  // 白 48%（深灰卡片上对比度约 4.9）
+    separator = Color(0x14FFFFFF),     // 白 8%
+    // 夜间（11-13 调整）：底、卡片、主要按钮仍是黑白灰；主题橙回到“小面积点缀”——链接字、进度、指示点、
+    // 滑动操作、快速定位滑块等。橙色比日间略亮略淡，在纯黑上清楚又不刺眼。
+    accent = Color(0xFFF08A4B),
+    accentSoft = Color(0xFF3A2A20),   // 橙色约 16% 压在深灰卡片上的实色（不用半透明，避免再改透明度时出错）
+    // 状态色保留但调暗调淡，只用在小圆点和文字上
+    good = Color(0xFF55A86F),
+    warning = Color(0xFFD4A65E),
+    critical = Color(0xFFE0686C),
     shadow = Color(0x00000000),
+    elevated = Color(0xFF2C2C2E),
+    fill = Color(0x1FFFFFFF),          // 白 12%
+    onAccent = Color(0xFF1C1C1E),     // 橙底上的字用深色，对比度约 7
+    selected = Color(0xFF48484A),
+    onSelected = Color(0xEBFFFFFF),
+    track = Color(0x1FFFFFFF),
+    trackThumb = Color(0xFF48484A),
+    hairline = Color(0x12FFFFFF),      // 白 7%
+    primary = Color(0xFFE3E3E6),       // 略灰的白：纯黑 OLED 上大块纯白会发光刺眼
+    onPrimary = Color(0xFF1C1C1E),
     isDark = true,
 )
 
@@ -104,3 +151,9 @@ fun ResoundTheme(mode: ThemeMode = ThemeMode.System, content: @Composable () -> 
         MaterialTheme(colorScheme = material, content = content)
     }
 }
+
+/**
+ * 在颜色原有透明度上再按比例变淡。主题里夜间的文字、分隔线等本身就是半透明的，
+ * 直接 copy(alpha = x) 会把它们变回不透明（例如分隔线变成纯白），所以一律用 fade。
+ */
+fun Color.fade(fraction: Float): Color = copy(alpha = alpha * fraction)

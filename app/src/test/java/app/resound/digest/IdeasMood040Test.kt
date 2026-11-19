@@ -1,5 +1,7 @@
 package app.resound.digest
 
+import kotlinx.datetime.toKotlinLocalDate
+import app.resound.data.testSql
 import android.app.Application
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
@@ -40,12 +42,12 @@ class IdeasMood040Test {
     @Before fun setup() {
         originalZone = TimeZone.getDefault()
         TimeZone.setDefault(TimeZone.getTimeZone("Asia/Shanghai"))
-        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries()
+        db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries()
             .addCallback(SearchIndex.callback).build()
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val llm = LlmClient()
         val runner = DigestRunner(context, db.memory(), llm, AndroidDigestSettings(context, llm), { "" }, { false })
-        memory = RoomMemoryRepository(db.memory(), runner, { error("禁止请求云端") }, scope)
+        memory = RoomMemoryRepository(db.memory(), runner, { error("禁止请求云端") }, scope, zoneProvider = app.resound.platform.ZoneProvider { java.time.ZoneId.systemDefault().id }, now = app.resound.platform.SystemNow, io = Dispatchers.IO)
     }
     @After fun close() = runBlocking {
         scope.coroutineContext[Job]!!.cancelAndJoin()
@@ -63,7 +65,7 @@ class IdeasMood040Test {
         db.memory().insertItems(listOf(MemoryItemEntity(id, id, category, null, "想法$id", null, null, null,
             id * 10, "Pending", created)))
     }
-    private fun vector(id: Long, cosine: Float = 1f, model: String = "test") {
+    private suspend fun vector(id: Long, cosine: Float = 1f, model: String = "test") {
         EmbeddingStore(db).save(EmbeddingStore.Document("item", id, "灵感\n想法$id"), model,
             floatArrayOf(cosine, sqrt(1f - cosine * cosine)))
     }
@@ -129,10 +131,10 @@ class IdeasMood040Test {
         idea(1, at(day.minusDays(1))); idea(2); idea(3)
         for (id in 1L..3L) vector(id)
         merge()
-        assertTrue(memory.dayItems(day).first().notes.isEmpty())
-        assertEquals(3, memory.dayItems(day.minusDays(1)).first().notes.single().repeats)
-        assertTrue(memory.events(day).first().all { it.items.isEmpty() })
-        assertEquals(3, memory.events(day.minusDays(1)).first().single().items.single().repeats)
+        assertTrue(memory.dayItems(day.toKotlinLocalDate()).first().notes.isEmpty())
+        assertEquals(3, memory.dayItems(day.minusDays(1).toKotlinLocalDate()).first().notes.single().repeats)
+        assertTrue(memory.events(day.toKotlinLocalDate()).first().all { it.items.isEmpty() })
+        assertEquals(3, memory.events(day.minusDays(1).toKotlinLocalDate()).first().single().items.single().repeats)
         assertEquals(listOf(20L, 30L), memory.mergedItems(1).first().map { it.sourceLineId })
         assertEquals(listOf(at() + 2000, at() + 3000), memory.mergedItems(1).first().map { it.at })
     }
@@ -153,7 +155,7 @@ class IdeasMood040Test {
     @Test fun migrationTwelveToThirteenPreservesRowsAndRoomValidatesSchema() = runBlocking {
         val name = "migration-040.db"; context.deleteDatabase(name)
         val path = context.getDatabasePath(name).apply { parentFile!!.mkdirs() }
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/12.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/12.json").readText()).getJSONObject("database")
         SQLiteDatabase.openOrCreateDatabase(path, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -171,7 +173,7 @@ class IdeasMood040Test {
         }
         val migrated = CaptureDatabase.open(context, name)
         try {
-            assertEquals(app.resound.data.CaptureDatabase.VERSION, migrated.openHelper.writableDatabase.version)
+            assertEquals(app.resound.data.CaptureDatabase.VERSION, migrated.testSql.version)
             val item = migrated.memory().itemsByCategory(listOf("灵感")).first().single()
             assertEquals("旧灵感", item.content); assertNull(item.mergedInto); assertFalse(item.noMerge)
         } finally { migrated.close() }

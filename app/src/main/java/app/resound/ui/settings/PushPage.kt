@@ -1,5 +1,6 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
@@ -26,15 +27,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalContext
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.os.PersistableBundle
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -72,8 +78,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun PushPage(repo: PushChannels, bottomPadding: Dp) {
     val c = Rs.colors
-    val channels by repo.channels.collectAsState(initial = emptyList())
-    val logs by remember { repo.logs(30) }.collectAsState(initial = emptyList())
+    val channels by repo.channels.collectAsStateWithLifecycle(initialValue = emptyList())
+    val logs by remember { repo.logs(30) }.collectAsStateWithLifecycle(initialValue = emptyList())
     var editing by remember { mutableStateOf<PushChannel?>(null) }
     var adding by remember { mutableStateOf(false) }
 
@@ -165,9 +171,9 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
     var format by remember { mutableStateOf(ch?.format ?: PushFormat.Markdown) }
     var sub by remember { mutableStateOf(ch?.subscription ?: PushSubscription.PhoneNotice) }
     var linked by remember { mutableStateOf(ch?.useLinkedNutstore ?: true) }
-    val linkedAccount by repo.linkedNutstoreAccount.collectAsState(initial = null)
+    val linkedAccount by repo.linkedNutstoreAccount.collectAsStateWithLifecycle(initialValue = null)
     // 卡 114：借用的是数据备份里选的那种云端存储（坚果云 / WebDAV / S3），显示它的名字和地址，不显示密钥 ID
-    val backupState = if (app.resound.AppGraph.isBackupReady) app.resound.AppGraph.backup.state.collectAsState().value else null
+    val backupState = if (app.resound.AppGraph.isBackupReady) app.resound.AppGraph.backup.state.collectAsStateWithLifecycle().value else null
     val caps = remember(kind) { repo.capabilities(kind) }
     var busy by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<Result<String>?>(null) }
@@ -205,13 +211,13 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
         val folderKind = kind == PushKind.MarkdownFolder
         if (folderKind) {
             Label("存到哪里")
-            app.resound.ui.skills.Segments(listOf("用数据备份的云端", "单独配置"), if (linked) 0 else 1) {
+            app.resound.ui.skills.Segments(listOf("用备份恢复的云端", "单独配置"), if (linked) 0 else 1) {
                 linked = it == 0
                 // 单独配置时服务器地址直接填好坚果云的，只需填账号和应用密码
                 if (!linked && values["url"].isNullOrBlank()) values["url"] = NUTSTORE_DAV
             }
-            if (linked) Text(linkedAccount?.let { _ -> backupState?.let { "用数据备份里的 ${it.cloud.title()}（${it.cloudLine()}），不用再填账号密码" } ?: "用数据备份里已连接的云端存储" }
-                ?: "数据备份里还没连接云端存储，先去连接，或改为单独配置（单独配置只支持 WebDAV）",
+            if (linked) Text(linkedAccount?.let { _ -> backupState?.let { "用备份恢复里的 ${it.cloud.title()}（${it.cloudLine()}），不用再填账号密码" } ?: "用数据备份里已连接的云端存储" }
+                ?: "备份恢复里还没连接云端存储，先去连接，或改为单独配置（单独配置只支持 WebDAV）",
                 style = RsType.caption, color = if (linkedAccount == null) c.critical else c.textSecondary)
         }
         fields.filter { !(folderKind && linked && it.key != "folder") }.forEach { f ->
@@ -219,7 +225,7 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
             Field(values[f.key] ?: "", if (ch != null && f.secret) "已保存，留空表示不改" else f.hint, f.secret) { values[f.key] = it.trim() }
         }
         val allowed = remember(kind) { repo.topics(kind) }
-        SubscriptionEditor(sub, caps, isNew = ch == null) { sub = it }
+        SubscriptionEditor(sub, caps, format, isNew = ch == null) { sub = it }
         if (caps.formats.size > 1) {
             Label("格式")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -251,10 +257,10 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
         }
         if (ch != null) {
             // 推送状态 + 现在推一次 / 全部重新生成
-            val st by remember(ch.id) { repo.status(ch.id) }.collectAsState(initial = null)
+            val st by remember(ch.id) { repo.status(ch.id) }.collectAsStateWithLifecycle(initialValue = null)
             st?.let { s -> StatusLine(s) }
             if (caps.audio && ch.subscription.audio != app.resound.push.AudioPush.Off) {
-                val a by remember(ch.id) { repo.audioStatus(ch.id) }.collectAsState(initial = null)
+                val a by remember(ch.id) { repo.audioStatus(ch.id) }.collectAsStateWithLifecycle(initialValue = null)
                 a?.let { s ->
                     val month = s.monthlyEstimateBytes?.let { " · 按最近 7 天估一个月约 ${app.resound.ui.verify.formatBytes(it)}" } ?: ""
                     Text("录音：已传 ${s.uploaded} 段" + (if (s.pending > 0) "，待传 ${s.pending} 段" else "") +
@@ -274,6 +280,7 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
                     scope.launch { result = repo.rebuild(ch.id); busy = false }
                 }
             }
+            if (ch.kind == PushKind.MarkdownFolder) AgentCopy(repo, ch.id)
             ActionButton(if (busy) "正在发送…" else "测试一下", ActionKind.Secondary, enabled = !busy) {
                 busy = true; result = null
                 scope.launch { result = repo.test(ch.id); busy = false }
@@ -283,6 +290,26 @@ private fun ChannelSheet(repo: PushChannels, ch: PushChannel?, onDismiss: () -> 
             }
         }
     }
+}
+
+/** 同步文件夹：复制一段话给 Claude Code、Codex 等智能体，让它只读这个文件夹。S3 不是 WebDAV，不显示。 */
+@Composable
+private fun AgentCopy(repo: PushChannels, id: Long) {
+    val c = Rs.colors
+    val context = LocalContext.current
+    val prompt by produceState<String?>(null, id) { value = repo.agentPrompt(id) }
+    var copied by remember { mutableStateOf(false) }
+    val text = prompt ?: return
+    ActionButton(if (copied) "已复制" else "复制给智能体", ActionKind.Secondary) {
+        val clip = ClipData.newPlainText("涛声记忆库", text).apply {
+            // 含应用密码：系统剪贴板预览里不显示内容
+            description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
+        }
+        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(clip)
+        copied = true
+    }
+    Text("粘贴给 Claude Code、Codex 等能运行命令的智能体，它就能读你的记忆。这段话含应用密码；不想让它读了，到网盘设置里删掉这个应用密码就行。",
+        style = RsType.caption, color = c.textSecondary)
 }
 
 @Composable
@@ -296,7 +323,7 @@ private fun Field(value: String, hint: String, secret: Boolean, onChange: (Strin
     BasicTextField(
         value, onChange, singleLine = true, textStyle = RsType.body.copy(color = c.text), cursorBrush = SolidColor(c.accent),
         visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.background).padding(horizontal = 14.dp, vertical = 12.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.fill).padding(horizontal = 14.dp, vertical = 12.dp),
         decorationBox = { inner -> Box { if (value.isEmpty()) Text(hint, style = RsType.body, color = c.textTertiary); inner() } },
     )
 }
@@ -305,21 +332,14 @@ private fun Field(value: String, hint: String, secret: Boolean, onChange: (Strin
 private fun Choice(text: String, on: Boolean, onClick: () -> Unit) {
     val c = Rs.colors
     // 未选中用白底：放在浅色分块里也看得清
-    val bg by animateColorAsState(if (on) c.accent else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "pushChoice")
-    val fg by animateColorAsState(if (on) Color.White else c.textSecondary, label = "pushChoiceFg")
+    val bg by animateColorAsState(if (on) c.selected else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "pushChoice")
+    val fg by animateColorAsState(if (on) c.onSelected else c.textSecondary, label = "pushChoiceFg")
     Text(text, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = fg,
         modifier = Modifier.springClick(onClick).clip(CircleShape).background(bg).padding(horizontal = 14.dp, vertical = 8.dp))
 }
 
 @Composable
-private fun Switch(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by animateDpAsState(if (on) 20.dp else 0.dp, spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+private fun Switch(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)
 
 private val KIND_GROUPS = listOf(
     "消息推送" to listOf(PushKind.PushPlus, PushKind.WeCom, PushKind.ServerChan, PushKind.Feishu, PushKind.DingTalk, PushKind.Telegram),
@@ -337,7 +357,7 @@ private fun shortName(k: PushKind) = when (k) {
 private fun KindTile(k: PushKind, on: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
     val tint = kindColor(k)
-    val bg by animateColorAsState(if (on) tint.copy(alpha = 0.14f) else c.background, label = "kindBg")
+    val bg by animateColorAsState(if (on) tint.copy(alpha = 0.14f) else c.fill, label = "kindBg")
     Column(modifier.springClick(onClick).clip(RoundedCornerShape(14.dp)).background(bg)
         .then(if (on) Modifier.border(1.5.dp, tint, RoundedCornerShape(14.dp)) else Modifier)
         .padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -384,10 +404,11 @@ private fun subscriptionLine(s: PushSubscription): String = buildList {
 @Composable
 private fun StatusLine(s: PushChannelStatus) {
     val c = Rs.colors
+    val lastPushAt = s.lastPushAt
     val text = when {
         s.running -> "正在推送…"
         s.lastError != null -> "上次没推成功：${s.lastError}"
-        s.lastPushAt != null -> "上次 ${app.resound.ui.verify.formatStamp(s.lastPushAt)}" + (s.lastResult?.let { " · $it" } ?: "")
+        lastPushAt != null -> "上次 ${app.resound.ui.verify.formatStamp(lastPushAt)}" + (s.lastResult?.let { " · $it" } ?: "")
         else -> "还没推过"
     }
     Text(text, style = RsType.subhead, color = if (s.lastError != null && !s.running) c.critical else c.textSecondary)
@@ -401,8 +422,11 @@ private fun hm(m: Int) = "%d:%02d".format(m / 60, m % 60)
  */
 @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, isNew: Boolean, onChange: (PushSubscription) -> Unit) {
+private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, format: PushFormat, isNew: Boolean, onChange: (PushSubscription) -> Unit) {
     val c = Rs.colors
+    val screenTimeOn = if (app.resound.AppGraph.isScreenTimeReady)
+        app.resound.AppGraph.screenTimeSettings.enabled.collectAsStateWithLifecycle().value
+    else false
     // 一键模板
     val templates = buildList {
         add("手机通知" to PushSubscription.PhoneNotice)
@@ -424,6 +448,7 @@ private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, is
         Text("这种通道只能发短消息，推不了整理结果和原话；想给智能体读，用同步文件夹或自定义接口。", style = RsType.caption, color = c.textTertiary)
     } else {
     SubLabel("整理结果（可多选）")
+    Text("每天凌晨会把前一天的地点、App、播放和事件按时间串成一段线索，写在当天文档开头。", style = RsType.caption, color = c.textTertiary)
     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         RecordKind.entries.forEach { k ->
             Choice(k.title, k in sub.records) { onChange(sub.copy(records = if (k in sub.records) sub.records - k else sub.records + k)) }
@@ -436,7 +461,7 @@ private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, is
     }
     }
     // 每日足迹：所有通道都能收；聊天类收文字摘要，自定义接口另附结构化数据和定位点
-    Block("每日足迹", "每天定时推当天去过哪、各待多久；要先在“设置 → 足迹”里开始记录") {
+    Block("每日足迹", "每天定时推当天去过哪、各待多久；要先在“设置 → 位置足迹”里开始记录") {
         ToggleRow("推每日足迹", if (caps.records) "在家/外出时长、停留地点和地址；自定义接口另附全部定位点" else "在家/外出时长、停留地点和地址",
             sub.footprint) { onChange(sub.copy(footprint = it)) }
         if (sub.footprint) {
@@ -445,6 +470,21 @@ private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, is
                 listOf(12, 18, 20, 21, 22, 23).map { it * 60 }.forEach { m -> Choice(hm(m), sub.footprintAt == m) { onChange(sub.copy(footprintAt = m)) } }
             }
             Text("位置会推到这个通道，注意保管；点“现在推一次”可以马上推今天的足迹。", style = RsType.caption, color = c.warning)
+        }
+    }
+    Block("每日屏幕时间", "每天定时推当天用了哪些 App、各用多久；要先在“设置 → 屏幕时间”里打开") {
+        val canToggle = screenTimeOn || sub.screenTime
+        ToggleRow("推每日屏幕时间", if (format == PushFormat.Json) "总时长和用得最多的 App；自定义接口另附完整时间线" else "总时长和用得最多的 App（只有 JSON 格式会附带完整时间线）",
+            sub.screenTime, enabled = canToggle) { onChange(sub.copy(screenTime = it)) }
+        if (!canToggle) {
+            Text("屏幕时间未开启，先在“设置 → 屏幕时间”里打开。", style = RsType.caption, color = c.textTertiary)
+        }
+        if (sub.screenTime) {
+            SubLabel("每天几点推")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(12, 18, 20, 21, 22, 23).map { it * 60 }.forEach { m -> Choice(hm(m), sub.screenTimeAt == m) { onChange(sub.copy(screenTimeAt = m)) } }
+            }
+            Text("App 使用记录会推到这个通道，注意保管。", style = RsType.caption, color = c.warning)
         }
     }
     // 卡 072：推录音（原始 OGG），只有坚果云同步文件夹能收文件
@@ -491,11 +531,11 @@ private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, is
                 listOf("一", "二", "三", "四", "五", "六", "日").forEachIndexed { i, w ->
                     val d = i + 1
                     val on = t.weekdays.isEmpty() || d in t.weekdays
-                    Box(Modifier.size(34.dp).clip(CircleShape).background(if (on) c.accent else c.background).springClick {
+                    Box(Modifier.size(34.dp).clip(CircleShape).background(if (on) c.selected else c.fill).springClick {
                         val cur = t.weekdays.ifEmpty { (1..7).toSet() }
                         val next = if (d in cur) cur - d else cur + d
                         if (next.isNotEmpty()) onChange(sub.copy(trigger = t.copy(weekdays = if (next.size == 7) emptySet() else next)))
-                    }, contentAlignment = Alignment.Center) { Text(w, style = RsType.subhead, color = if (on) Color.White else c.textSecondary) }
+                    }, contentAlignment = Alignment.Center) { Text(w, style = RsType.subhead, color = if (on) c.onSelected else c.textSecondary) }
                 }
             }
         }
@@ -541,7 +581,7 @@ private fun SubscriptionEditor(sub: PushSubscription, caps: PushCapabilities, is
 @Composable
 private fun Block(title: String, desc: String? = null, content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
     val c = Rs.colors
-    Column(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(18.dp)).background(c.background).padding(14.dp),
+    Column(Modifier.fillMaxWidth().clip(androidx.compose.foundation.shape.RoundedCornerShape(18.dp)).background(c.fill).padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(title, style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text)
         desc?.let { Text(it, style = RsType.caption, color = c.textTertiary) }
@@ -555,13 +595,13 @@ private fun SubLabel(text: String) {
 }
 
 @Composable
-private fun ToggleRow(title: String, desc: String, on: Boolean, onChange: (Boolean) -> Unit) {
+private fun ToggleRow(title: String, desc: String, on: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
     val c = Rs.colors
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.then(if (enabled) Modifier else Modifier.alpha(0.4f)), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(title, style = RsType.body, color = c.text)
             Text(desc, style = RsType.caption, color = c.textSecondary)
         }
-        Switch(on, onChange)
+        Switch(on) { if (enabled) onChange(it) }
     }
 }

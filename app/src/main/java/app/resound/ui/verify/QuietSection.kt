@@ -1,5 +1,6 @@
 package app.resound.ui.verify
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -21,7 +22,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -39,14 +39,15 @@ import app.resound.ui.items.Label
 import app.resound.ui.skills.Toggle
 import app.resound.ui.theme.Rs
 import app.resound.ui.theme.RsType
-import java.time.DayOfWeek
+import kotlinx.datetime.DayOfWeek
+import kotlinx.datetime.isoDayNumber
 
 /** 录音与后台页的“停录时段”：每条一行（名字、时间、重复、开关），点开编辑；底部添加 */
 @Composable
 internal fun QuietSection(schedule: QuietSchedule) {
     val c = Rs.colors
-    val rules by schedule.rules.collectAsState()
-    val active by schedule.active.collectAsState()
+    val rules by schedule.rules.collectAsStateWithLifecycle()
+    val active by schedule.active.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<QuietRule?>(null) }
     var adding by remember { mutableStateOf(false) }
     Section("停录时段", trailing = {
@@ -124,7 +125,7 @@ private fun QuietRuleSheet(rule: QuietRule?, isNew: Boolean, onSave: (QuietRule)
         SheetInput(name, "如 睡眠、午休、上课") { name = it.take(8) }
         Label("时间")
         // 两张等宽时间卡：开始 → 结束，选中的那张亮起；下面一条居中的滚轮调它，中间写总时长
-        RsCard(padding = PaddingValues(12.dp), color = c.background) {
+        RsCard(padding = PaddingValues(12.dp), color = c.fill) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 TimeCard("开始", start, null, !pickingEnd, Modifier.weight(1f)) { pickingEnd = false }
                 Column(Modifier.padding(horizontal = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -148,7 +149,7 @@ private fun QuietRuleSheet(rule: QuietRule?, isNew: Boolean, onSave: (QuietRule)
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            DayOfWeek.entries.forEach { d -> DayDot(DAY_NAMES[d.value - 1], d in days) { days = if (d in days) days - d else days + d } }
+            DayOfWeek.entries.forEach { d -> DayDot(DAY_NAMES[d.isoDayNumber - 1], d in days) { days = if (d in days) days - d else days + d } }
         }
         if (end <= start && days != DayOfWeek.entries.toSet()) Text("跨到第二天的时段，按开始那天算重复。", style = RsType.caption, color = c.textTertiary)
         Spacer(Modifier.height(4.dp))
@@ -185,7 +186,7 @@ internal fun daysText(days: Set<DayOfWeek>): String = when (days) {
     DayOfWeek.entries.toSet() -> "每天"
     WORKDAYS -> "工作日"
     WEEKEND -> "周末"
-    else -> "周" + days.sortedBy { it.value }.joinToString("、") { DAY_NAMES[it.value - 1] }
+    else -> "周" + days.sortedBy { it.isoDayNumber }.joinToString("、") { DAY_NAMES[it.isoDayNumber - 1] }
 }
 
 /** 一张时间卡：上面小字“开始/结束”，下面大号时刻；选中时浅橙底、细描边 */
@@ -193,7 +194,7 @@ internal fun daysText(days: Set<DayOfWeek>): String = when (days) {
 private fun TimeCard(label: String, minutes: Int, tag: String?, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val c = Rs.colors
     val bg by androidx.compose.animation.animateColorAsState(if (selected) c.accentSoft else c.card, label = "timeCard")
-    val edge by androidx.compose.animation.animateColorAsState(if (selected) c.accent else c.separator, label = "timeEdge")
+    val edge by androidx.compose.animation.animateColorAsState(if (selected) c.selected else c.separator, label = "timeEdge")
     Column(modifier.clip(RoundedCornerShape(16.dp)).background(bg).border(1.dp, edge, RoundedCornerShape(16.dp))
         .springClick(onClick).padding(vertical = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -213,9 +214,9 @@ private fun TimeCard(label: String, minutes: Int, tag: String?, selected: Boolea
 @Composable
 private fun DayDot(label: String, on: Boolean, onClick: () -> Unit) {
     val c = Rs.colors
-    val bg by androidx.compose.animation.animateColorAsState(if (on) c.accent else c.card, label = "day")
+    val bg by androidx.compose.animation.animateColorAsState(if (on) c.selected else c.card, label = "day")
     Box(Modifier.size(38.dp).clip(CircleShape).background(bg).springClick(onClick), contentAlignment = Alignment.Center) {
-        Text(label, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) androidx.compose.ui.graphics.Color.White else c.textSecondary)
+        Text(label, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) c.onSelected else c.textSecondary)
     }
 }
 

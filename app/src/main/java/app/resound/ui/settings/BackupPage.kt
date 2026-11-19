@@ -1,5 +1,6 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
@@ -27,7 +28,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -62,7 +62,7 @@ import java.time.format.DateTimeFormatter
 @Composable
 fun BackupPage(repo: BackupRepository, bottomPadding: Dp) {
     val c = Rs.colors
-    val s by repo.state.collectAsState()
+    val s by repo.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val configured = s.account != null && s.hasPassword
     var settingPass by remember { mutableStateOf(false) }
@@ -73,7 +73,7 @@ fun BackupPage(repo: BackupRepository, bottomPadding: Dp) {
     var cloud by remember(cloudCache) { mutableStateOf(cloudCache.summary) }
     var cloudReadError by remember(cloudCache) { mutableStateOf<String?>(null) }
     var restoringAll by remember { mutableStateOf<String?>(null) }
-    val local by repo.local.collectAsState()
+    val local by repo.local.collectAsStateWithLifecycle()
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(if (configured && local.folder == null) 1 else 0) }
     androidx.compose.runtime.LaunchedEffect(cloudCache, s.lastBackupAt, tab) {
         if (configured && tab == 1) {
@@ -181,7 +181,7 @@ private fun Field(value: String, hint: String, type: KeyboardType, secret: Boole
         keyboardOptions = KeyboardOptions(keyboardType = type),
         modifier = Modifier.fillMaxWidth(),
         decorationBox = { inner ->
-            Box(Modifier.clip(RoundedCornerShape(14.dp)).background(c.background).padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Box(Modifier.clip(RoundedCornerShape(14.dp)).background(c.fill).padding(horizontal = 14.dp, vertical = 12.dp)) {
                 if (value.isEmpty()) Text(hint, style = RsType.body, color = c.textTertiary)
                 inner()
             }
@@ -191,14 +191,7 @@ private fun Field(value: String, hint: String, type: KeyboardType, secret: Boole
 
 /** 苹果风格开关 */
 @Composable
-private fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) {
-    val c = Rs.colors
-    val track by animateColorAsState(if (on) c.accent else c.separator, label = "track")
-    val x by animateDpAsState(if (on) 20.dp else 0.dp, spring(dampingRatio = 0.65f, stiffness = Spring.StiffnessMedium), label = "knob")
-    Box(Modifier.size(width = 50.dp, height = 30.dp).clip(CircleShape).background(track).springClick { onChange(!on) }.padding(2.dp)) {
-        Box(Modifier.offset(x = x).size(26.dp).clip(CircleShape).background(Color.White))
-    }
-}
+private fun Toggle(on: Boolean, onChange: (Boolean) -> Unit) = app.resound.ui.verify.RsToggle(on, onChange)
 
 private fun dateTime(at: Long): String =
     Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("M月d日 HH:mm:ss"))

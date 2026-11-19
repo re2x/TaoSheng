@@ -1,5 +1,6 @@
 package app.resound.ui.importer
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.resound.appDisplayName
 import android.net.Uri
 import android.widget.Toast
@@ -33,7 +34,6 @@ import androidx.compose.material3.TimeInput
 import androidx.compose.material3.TimePickerDefaults
 import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -71,7 +71,7 @@ import java.time.format.DateTimeFormatter
 fun ImportHost() {
     if (!AppGraph.isImporterReady) return
     val importer = AppGraph.importer
-    val pending by importer.pending.collectAsState()
+    val pending by importer.pending.collectAsStateWithLifecycle()
     if (pending.isNotEmpty()) ImportSheet(importer, pending)
 }
 
@@ -96,7 +96,7 @@ fun ImportButton() {
 fun ImportBanner(modifier: Modifier = Modifier) {
     if (!AppGraph.isImporterReady) return
     val c = Rs.colors
-    val p by AppGraph.importer.progress.collectAsState()
+    val p by AppGraph.importer.progress.collectAsStateWithLifecycle()
     AnimatedVisibility(p.running || p.error != null, modifier, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
         RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -109,7 +109,7 @@ fun ImportBanner(modifier: Modifier = Modifier) {
             if (p.error != null) Text(p.error!!, style = RsType.caption, color = c.critical, modifier = Modifier.padding(top = 4.dp))
             else {
                 Spacer(Modifier.height(10.dp))
-                Box(Modifier.fillMaxWidth().height(5.dp).clip(CircleShape).background(c.background)) {
+                Box(Modifier.fillMaxWidth().height(5.dp).clip(CircleShape).background(c.fill)) {
                     Box(Modifier.fillMaxWidth(p.percent / 100f).height(5.dp).clip(CircleShape).background(c.accent))
                 }
                 Text("导入完会马上转写；录音和平时录的一样，按原声保留天数保存", style = RsType.caption, color = c.textTertiary, modifier = Modifier.padding(top = 8.dp))
@@ -134,7 +134,7 @@ private fun ImportSheet(importer: AudioImporter, pending: List<PendingImport>) {
     ) {
         pending.forEach { p ->
             val start = starts[p.id] ?: 0L
-            RsCard(color = c.background, padding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+            RsCard(color = c.fill, padding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(p.info.displayName, style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -217,8 +217,8 @@ internal fun KindChoice(selected: app.resound.importer.ImportKind?, onSelect: (a
     androidx.compose.foundation.layout.FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         app.resound.importer.ImportKind.entries.forEach { k ->
             val on = k == selected
-            val bg by animateColorAsState(if (on) c.accent else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "kind")
-            Text(k.title, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) Color.White else c.textSecondary,
+            val bg by animateColorAsState(if (on) c.selected else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "kind")
+            Text(k.title, style = RsType.subhead.copy(fontWeight = FontWeight.Medium), color = if (on) c.onSelected else c.textSecondary,
                 modifier = Modifier.clip(CircleShape).background(bg).springClick { onSelect(k) }.padding(horizontal = 14.dp, vertical = 8.dp))
         }
     }
@@ -255,9 +255,9 @@ private fun StartEditor(start: Long, onChange: (Long) -> Unit) {
             (0L..3L).forEach { back ->
                 val d = today.minusDays(back)
                 val on = d == day
-                val bg by animateColorAsState(if (on) c.accent else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "importDay")
+                val bg by animateColorAsState(if (on) c.selected else c.card, spring(stiffness = Spring.StiffnessMediumLow), label = "importDay")
                 Text(listOf("今天", "昨天", "前天", d.format(DateTimeFormatter.ofPattern("M月d日")))[back.toInt()],
-                    style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = if (on) Color.White else c.textSecondary,
+                    style = RsType.caption.copy(fontWeight = FontWeight.Medium), color = if (on) c.onSelected else c.textSecondary,
                     modifier = Modifier.clip(CircleShape).background(bg).springClick { day = d; emit() }.padding(horizontal = 12.dp, vertical = 7.dp))
             }
         }

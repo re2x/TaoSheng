@@ -1,9 +1,9 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import android.content.Context
 import androidx.compose.foundation.clickable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -125,19 +125,25 @@ fun AboutPage(version: String?, bottom: Dp) {
         }
 
         AboutCard("隐私") {
-            Text("不用注册账号，没有我们的服务器；密钥存在系统安全区；录音转写后 24 小时自动删除。",
+            Text("不用注册账号，没有我们的服务器；密钥存在系统安全区；原录音默认保留 3 天后自动删除，可在“语音转写”里改。",
                 style = RsType.body, color = c.text)
         }
 
-        AboutCard("问题反馈") {
-            Text("遇到闪退或功能不对，导出问题记录发给开发。只含运行情况和出错位置，不含原话、待办和密钥。",
-                style = RsType.body, color = c.textSecondary)
+        AboutCard("更新日志") {
+            Text("每个版本改了什么，都能在“版本更新”里回看。", style = RsType.body, color = c.textSecondary)
             Spacer(Modifier.height(12.dp))
-            ExportProblemPill()
+            Pill("查看更新日志", filled = false) { app.resound.ui.ShellNav.openSettings(SettingsPage.Update) }
         }
 
-        AboutCard("开源") {
-            Text("涛声以 MIT 许可开源，代码、更新记录和问题反馈都在项目主页。", style = RsType.body, color = c.textSecondary)
+        AboutCard("问题反馈") {
+            Text("遇到闪退或功能不对，在“高级诊断”导出问题记录发给开发。",
+                style = RsType.body, color = c.textSecondary)
+            Spacer(Modifier.height(12.dp))
+            Pill("去高级诊断", filled = false) { app.resound.ui.ShellNav.openSettings(SettingsPage.Advanced) }
+        }
+
+        AboutCard("源码公开") {
+            Text("涛声源码公开（FSL-1.1-MIT），每个版本发布两年后自动转为 MIT。代码、更新记录和问题反馈都在项目主页。", style = RsType.body, color = c.textSecondary)
             Spacer(Modifier.height(12.dp))
             HomepageLink()
         }
@@ -192,7 +198,7 @@ fun displayVersion(version: String): String =
 private fun PreviewCard() {
     val c = Rs.colors
     val updater = AppGraph.updater
-    val on by updater.previewChannel.collectAsState()
+    val on by updater.previewChannel.collectAsStateWithLifecycle()
     AboutCard("开发者选项") {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -241,7 +247,7 @@ internal fun ExportProblemPill(label: String = "导出问题记录", onDone: () 
 fun CrashNotice(topGap: Dp = 0.dp) {
     if (!AppGraph.isProblemReportsReady) return
     val c = Rs.colors
-    val at by AppGraph.problemReports.lastCrashAt.collectAsState()
+    val at by AppGraph.problemReports.lastCrashAt.collectAsStateWithLifecycle()
     if (at == null) return
     Spacer(Modifier.height(topGap))
     RsCard(padding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {

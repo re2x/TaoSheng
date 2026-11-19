@@ -1,5 +1,6 @@
 package app.resound.ui.settings
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
@@ -27,8 +28,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,7 +60,7 @@ import app.resound.ui.verify.springClick
 fun UpdatePage(updater: AppUpdater, bottom: Dp) {
     val c = Rs.colors
     val context = LocalContext.current
-    val state by updater.state.collectAsState()
+    val state by updater.state.collectAsStateWithLifecycle()
     // 从系统设置“允许安装应用”回来时重新判断
     var resumed by remember { mutableIntStateOf(0) }
     LifecycleResumeEffect(Unit) { resumed++; onPauseOrDispose {} }
@@ -97,7 +100,7 @@ fun UpdatePage(updater: AppUpdater, bottom: Dp) {
             }
         }
 
-        val auto by updater.autoCheck.collectAsState()
+        val auto by updater.autoCheck.collectAsStateWithLifecycle()
         RsCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -109,25 +112,37 @@ fun UpdatePage(updater: AppUpdater, bottom: Dp) {
                 app.resound.ui.skills.Toggle(auto) { updater.setAutoCheck(it) }
             }
         }
+
+        // 更新日志：装好以后也能回看每一版改了什么（读安装包里的 CHANGELOG.md，不用联网）
+        ChangelogCard(updater.currentVersion)
     }
 }
 
 @Composable
 private fun NewVersionCard(info: UpdateInfo, state: UpdateState, canInstall: Boolean, updater: AppUpdater, allowInstall: () -> Unit) {
+    RsCard(Modifier.animateContentSize()) { NewVersionBody(info, state, canInstall, updater, allowInstall) }
+}
+
+/** 设置更新页和首页新版本弹窗共用：同一套下载、安装、失败处理 */
+@Composable
+internal fun NewVersionBody(info: UpdateInfo, state: UpdateState, canInstall: Boolean, updater: AppUpdater, allowInstall: () -> Unit,
+                            previewLines: Int = 10, showVersion: Boolean = true, onLater: () -> Unit = { updater.later() }, onSkip: () -> Unit = { updater.skip() }) {
     val c = Rs.colors
-    RsCard(Modifier.animateContentSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+    val context = LocalContext.current
+    Column {
+        val size = (if (info.incremental) "增量更新 · " else "完整安装包 · ") + formatBytes(info.downloadBytes)
+        // 首页弹窗标题已写版本号，这里只留大小
+        if (showVersion) Row(verticalAlignment = Alignment.CenterVertically) {
             Text(displayVersion(info.versionName), style = RsType.title, color = c.text, modifier = Modifier.weight(1f))
-            Text((if (info.incremental) "增量更新 · " else "完整安装包 · ") + formatBytes(info.downloadBytes),
-                style = RsType.subhead, color = c.textTertiary)
-        }
+            Text(size, style = RsType.subhead, color = c.textTertiary)
+        } else Text(size, style = RsType.subhead, color = c.textTertiary)
         if (info.notes.isNotBlank()) {
             Spacer(Modifier.height(10.dp))
             // 更新说明是 Markdown（标题、列表、粗体）；长的先显示开头，点一下展开全部
             var open by remember(info.versionName) { mutableStateOf(false) }
             val notes = info.notes.trim()
-            val long = notes.lines().size > 12
-            app.resound.ui.ask.AnswerText(if (open || !long) notes else notes.lines().take(10).joinToString("\n"))
+            val long = notes.lines().size > previewLines + 2
+            app.resound.ui.ask.AnswerText(if (open || !long) notes else notes.lines().take(previewLines).joinToString("\n"))
             if (long) Text(if (open) "收起" else "展开全部更新内容", style = RsType.subhead, color = c.accent,
                 modifier = Modifier.padding(top = 6.dp).springClick { open = !open })
         }
@@ -135,11 +150,11 @@ private fun NewVersionCard(info: UpdateInfo, state: UpdateState, canInstall: Boo
         when (state) {
             is UpdateState.Available -> {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Pill("下载", filled = true) { updater.download() }
-                    Pill("稍后", filled = false) { updater.later() }
+                    Pill("立即更新", filled = true) { updater.download() }
+                    Pill("稍后", filled = false, onClick = onLater)
                     Spacer(Modifier.weight(1f))
                     Text("跳过这个版本", style = RsType.subhead, color = c.textTertiary,
-                        modifier = Modifier.clip(CircleShape).springClick { updater.skip() }.padding(horizontal = 6.dp, vertical = 9.dp))
+                        modifier = Modifier.clip(CircleShape).springClick(onSkip).padding(horizontal = 6.dp, vertical = 9.dp))
                 }
             }
             is UpdateState.Downloading -> {
@@ -167,17 +182,71 @@ private fun NewVersionCard(info: UpdateInfo, state: UpdateState, canInstall: Boo
             } else {
                 Text("请在系统弹窗里点“更新”或“继续安装”", style = RsType.subhead.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium), color = c.accent)
                 Spacer(Modifier.height(6.dp))
-                Text("这一步是系统的安全确认，涛声没法代点。没看到弹窗的话，下拉通知栏点“涛声更新等待确认”", style = RsType.caption, color = c.textTertiary)
+                Text("这一步是系统的安全确认，涛声没法代点。没看到弹窗的话，下拉通知栏点“点这里完成安装”", style = RsType.caption, color = c.textTertiary)
             }
             is UpdateState.Failed -> {
                 Text(state.message, style = RsType.subhead, color = c.warning)
                 Spacer(Modifier.height(8.dp))
-                Pill("重试", filled = false) { updater.download() }
+                // 个别系统（如鸿蒙卓易通）里应用内安装走不通，给一条浏览器下载的退路
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Pill("重试", filled = false) { updater.download() }
+                    Pill("用浏览器下载", filled = false) {
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(RELEASES_PAGE)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                    }
+                }
             }
             else -> Unit
         }
+        InstallFallback(info, state)
     }
 }
+
+/**
+ * 卡 206：系统安装确认没弹出来（小米等会拦后台弹窗）时的退路。
+ * 用已经合成好的完整安装包交给系统安装器，不用重新下载；小米/澎湃再给两个权限直达按钮。
+ */
+@Composable
+private fun InstallFallback(info: UpdateInfo, state: UpdateState) {
+    val c = Rs.colors
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val flow = remember { runCatching { app.resound.update.UpdateInstallActions.systemInstallerAvailable }.getOrNull() } ?: return
+    val ready by flow.collectAsStateWithLifecycle()
+    if (ready?.versionName != info.versionName) return
+    val activity = remember(context) { generateSequence(context) { (it as? android.content.ContextWrapper)?.baseContext }.filterIsInstance<android.app.Activity>().firstOrNull() } ?: return
+    val xiaomi = remember { runCatching { app.resound.update.UpdateInstallActions.showXiaomiInstallHint }.getOrDefault(false) }
+    var handing by remember { mutableStateOf(false) }
+    var note by remember { mutableStateOf<String?>(null) }
+    Spacer(Modifier.height(14.dp))
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.fill).padding(14.dp)) {
+        Text("系统确认没弹出来？", style = RsType.body.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold), color = c.text)
+        Spacer(Modifier.height(4.dp))
+        Text("用已经下载好的安装包交给系统安装，不用重新下载，数据都在", style = RsType.caption, color = c.textSecondary)
+        Spacer(Modifier.height(10.dp))
+        Pill(if (handing) "正在打开…" else "用系统安装器安装", filled = true) {
+            if (handing) return@Pill
+            handing = true; note = null
+            scope.launch {
+                val ok = runCatching { app.resound.update.UpdateInstallActions.installWithSystem(activity) }.getOrDefault(false)
+                note = if (ok) "已交给系统，按提示点“安装”即可" else "没能打开系统安装器，可以用浏览器下载完整安装包"
+                handing = false
+            }
+        }
+        note?.let { Text(it, style = RsType.caption, color = c.textTertiary, modifier = Modifier.padding(top = 6.dp)) }
+        if (xiaomi) {
+            Spacer(Modifier.height(12.dp))
+            Text("小米、澎湃系统默认会拦后台弹出的安装确认。打开下面两项，下次就能直接弹出", style = RsType.caption, color = c.textSecondary)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Pill("后台弹出界面", filled = false) { app.resound.update.UpdateInstallActions.openXiaomiPermissions(activity) }
+                Pill("安装未知应用", filled = false) { app.resound.update.UpdateInstallActions.openUnknownApps(activity) }
+            }
+        }
+    }
+}
+
+/** 魔搭发布页：国内能直接打开，正式版和预览版都在这里 */
+internal const val RELEASES_PAGE = "https://modelscope.cn/models/OpenRecode/TaoSheng-releases/files"
 
 /** 细长进度条，进度变化时平滑过渡 */
 @Composable
@@ -189,7 +258,7 @@ private fun Progress(fraction: Float) {
     }
 }
 
-private fun UpdateState.info(): UpdateInfo? = when (this) {
+internal fun UpdateState.info(): UpdateInfo? = when (this) {
     is UpdateState.Available -> info
     is UpdateState.Downloading -> info
     is UpdateState.Assembling -> info

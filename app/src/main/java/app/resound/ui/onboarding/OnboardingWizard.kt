@@ -1,5 +1,7 @@
 package app.resound.ui.onboarding
 
+import kotlinx.datetime.toKotlinLocalDate
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.Manifest
 import android.content.ClipboardManager
 import android.content.Context
@@ -241,7 +243,7 @@ private fun Reason(icon: String, title: String, why: String) {
 @Composable
 private fun modelReady(): Boolean {
     val settings = (if (AppGraph.isTranscribeReady) AppGraph.transcribeSettings as? AndroidTranscribeSettings else null) ?: return true
-    return settings.ready.collectAsState().value
+    return settings.ready.collectAsStateWithLifecycle().value
 }
 
 private val percent = Regex("""下载 (\d+)%""")
@@ -255,9 +257,9 @@ private fun ModelProgress(big: Boolean = false) {
     val c = Rs.colors
     val context = LocalContext.current
     val settings = (if (AppGraph.isTranscribeReady) AppGraph.transcribeSettings as? AndroidTranscribeSettings else null) ?: return
-    val ready by settings.ready.collectAsState()
-    val revision by settings.modelRevision.collectAsState()
-    val backend by settings.backend.collectAsState()
+    val ready by settings.ready.collectAsStateWithLifecycle()
+    val revision by settings.modelRevision.collectAsStateWithLifecycle()
+    val backend by settings.backend.collectAsStateWithLifecycle()
     val prefs = remember { context.getSharedPreferences("local-asr", Context.MODE_PRIVATE) }
     val status = remember(revision, ready) { if (ready) null else prefs.getString("download-${backend.name}", null) }
     val pct = status?.let { percent.find(it)?.groupValues?.get(1)?.toIntOrNull() }
@@ -273,9 +275,9 @@ private fun ModelProgress(big: Boolean = false) {
         }
         if (!ready) {
             Spacer(Modifier.height(10.dp))
-            if (pct != null && !installing) androidx.compose.material3.LinearProgressIndicator(progress = { shown }, color = c.accent, trackColor = c.background,
+            if (pct != null && !installing) androidx.compose.material3.LinearProgressIndicator(progress = { shown }, color = c.accent, trackColor = c.fill,
                 modifier = Modifier.fillMaxWidth().height(if (big) 8.dp else 6.dp).clip(CircleShape))
-            else androidx.compose.material3.LinearProgressIndicator(color = c.accent, trackColor = c.background,
+            else androidx.compose.material3.LinearProgressIndicator(color = c.accent, trackColor = c.fill,
                 modifier = Modifier.fillMaxWidth().height(if (big) 8.dp else 6.dp).clip(CircleShape))
             Spacer(Modifier.height(8.dp))
             Text(status?.substringAfter(" · ", "")?.takeIf { pct != null && !installing && it.isNotBlank() }
@@ -365,13 +367,14 @@ private fun ColumnScope.DeepSeek(onNext: () -> Unit, onLater: () -> Unit) {
 @Composable
 private fun ColumnScope.TryIt(capture: CaptureController, transcripts: TranscriptRepository, memory: MemoryRepository, since: Long, onDone: () -> Unit) {
     val c = Rs.colors
-    val status by capture.status.collectAsState()
+    val status by capture.status.collectAsStateWithLifecycle()
+    val micLevel by capture.level.collectAsStateWithLifecycle(0f)
     val today = remember { LocalDate.now() }
-    val segments by remember { transcripts.day(today) }.collectAsState(emptyList())
+    val segments by remember { transcripts.day(today.toKotlinLocalDate()) }.collectAsStateWithLifecycle(emptyList())
     val line = segments.flatMap { it.lines }.filter { it.startAt >= since && it.text.isNotBlank() }.maxByOrNull { it.startAt }
-    val events by remember { memory.events(today) }.collectAsState(emptyList())
+    val events by remember { memory.events(today.toKotlinLocalDate()) }.collectAsStateWithLifecycle(emptyList())
     val event = events.filter { it.startAt >= since - 60_000 }.maxByOrNull { it.startAt }
-    val hasKey = if (AppGraph.isMemoryReady) AppGraph.digestSettings.hasKey.collectAsState().value else false
+    val hasKey = if (AppGraph.isMemoryReady) AppGraph.digestSettings.hasKey.collectAsStateWithLifecycle().value else false
     var organizing by remember { mutableStateOf(false) }
     val ready = modelReady()
     Spacer(Modifier.height(20.dp))
@@ -392,7 +395,7 @@ private fun ColumnScope.TryIt(capture: CaptureController, transcripts: Transcrip
     Text("比如：“明天下午三点和老王开会。”说完停一两秒。", style = RsType.body, color = c.textSecondary)
     Spacer(Modifier.height(28.dp))
     // 实时音量：说话时柱子跟着跳，让人知道涛声在听
-    val level by animateFloatAsState(status.level.coerceIn(0f, 1f), tween(80), label = "level")
+    val level by animateFloatAsState(micLevel.coerceIn(0f, 1f), tween(80), label = "level")
     Row(Modifier.fillMaxWidth().height(72.dp), horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
         verticalAlignment = Alignment.CenterVertically) {
         listOf(0.5f, 0.8f, 1f, 0.7f, 0.9f, 0.6f, 0.4f).forEach { k ->

@@ -1,5 +1,6 @@
 package app.resound.transcribe
 
+import app.resound.data.testSql
 import android.app.Application
 import androidx.room.Room
 import app.resound.data.*
@@ -24,7 +25,7 @@ class AsrSpeed073Test {
     @Before fun prepare() { prefs.edit().clear().commit() }
     @After fun close() { scope.cancel() }
 
-    @Test fun expiryAndRestartKeepTheRecordingStartDecision() {
+    @Test fun expiryAndRestartKeepTheRecordingStartDecision() = runBlocking {
         var time = 1000L
         val settings = AndroidAsrSpeedSettings(prefs, scope) { time }
         assertTrue(settings.separateSpeakers.value)
@@ -39,7 +40,7 @@ class AsrSpeed073Test {
         assertTrue(restored.effectiveSeparateSpeakers(end))
     }
 
-    @Test fun manualStopAndPermanentSwitchDoNotRewriteEarlierSegments() {
+    @Test fun manualStopAndPermanentSwitchDoNotRewriteEarlierSegments() = runBlocking {
         var time = 1000L
         val settings = AndroidAsrSpeedSettings(prefs, scope) { time }
         settings.startClassMode(null)
@@ -53,7 +54,7 @@ class AsrSpeed073Test {
     }
 
     @Test fun concurrentResultsStayWithTheirSegmentsAndOffClearsIdentity() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         val files = (1..2).map { File.createTempFile("speed", ".ogg", context.cacheDir).apply { writeBytes(byteArrayOf(1)) } }
         try {
             files.forEachIndexed { i, file -> db.capture().segment(SegmentEntity(startAt = (i + 1) * 1000L,
@@ -91,7 +92,7 @@ class AsrSpeed073Test {
     }
 
     @Test fun cancelBothCloudRequestsRecordsEachAttemptAndKeepsAudio() = runBlocking {
-        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).allowMainThreadQueries().build()
+        val db = Room.inMemoryDatabaseBuilder(context, CaptureDatabase::class.java).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().build()
         val files = (1..2).map { File.createTempFile("cancel", ".ogg", context.cacheDir).apply { writeBytes(byteArrayOf(1)) } }
         try {
             files.forEachIndexed { i, file -> db.capture().segment(SegmentEntity(startAt = i * 1000L,
@@ -116,7 +117,7 @@ class AsrSpeed073Test {
 
     @Test fun migration24KeepsDataAndHistoricalSpeakerState() = runBlocking {
         val name = "migration073.db"; context.deleteDatabase(name)
-        val schema = JSONObject(File("schemas/app.resound.data.CaptureDatabase/24.json").readText()).getJSONObject("database")
+        val schema = JSONObject(File("../shared/schemas/app.resound.data.CaptureDatabase/24.json").readText()).getJSONObject("database")
         context.openOrCreateDatabase(name, 0, null).use { old ->
             val entities = schema.getJSONArray("entities")
             for (i in 0 until entities.length()) {
@@ -132,9 +133,9 @@ class AsrSpeed073Test {
             old.execSQL("INSERT INTO segments(id,startAt,endAt,sourceId,path,sizeBytes,status) VALUES(2,3,4,'mic','/pending',1,'Pending')")
             old.version = 24
         }
-        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).allowMainThreadQueries().addMigrations(*CaptureDatabase.MIGRATIONS).build()
+        val db = Room.databaseBuilder(context, CaptureDatabase::class.java, name).setDriver(androidx.sqlite.driver.AndroidSQLiteDriver()).allowMainThreadQueries().addMigrations(*CaptureDatabase.MIGRATIONS).build()
         try {
-            assertEquals(CaptureDatabase.VERSION, db.openHelper.writableDatabase.version)
+            assertEquals(CaptureDatabase.VERSION, db.testSql.version)
             assertEquals(true, db.transcribe().segment(1).separateSpeakers)
             assertNull(db.transcribe().segment(2).separateSpeakers)
         } finally { db.close(); context.deleteDatabase(name) }

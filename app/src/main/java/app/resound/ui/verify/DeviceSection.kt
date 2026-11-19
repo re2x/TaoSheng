@@ -1,5 +1,6 @@
 package app.resound.ui.verify
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -24,6 +25,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import app.resound.devices.CardStatus
 import app.resound.devices.DeviceCards
 import app.resound.devices.DeviceState
@@ -41,10 +43,23 @@ import app.resound.ui.theme.RsType
 fun DeviceSection(devices: Devices, cards: DeviceCards, scanError: kotlinx.coroutines.flow.StateFlow<String?>) {
     val c = Rs.colors
     val context = LocalContext.current
-    val paired by devices.devices.collectAsState()
-    val found by devices.found.collectAsState()
-    val error by scanError.collectAsState()
-    val installed by cards.cards.collectAsState()
+    val rawPaired by devices.devices.collectAsStateWithLifecycle()
+    // 管理连接的补传进度来自实际已打开的文件通道，不沿用收音连接的旧状态。
+    val paired = rawPaired.map { if (it.backfill != null) it.copy(status = DeviceStatus.Backfilling) else it }
+    val found by devices.found.collectAsStateWithLifecycle()
+    val error by scanError.collectAsStateWithLifecycle()
+    val installed by cards.cards.collectAsStateWithLifecycle()
+    val inputs = devices as? app.resound.devices.android.DeviceInputs
+    val cached by (inputs?.lastDeviceStatus ?: remember { kotlinx.coroutines.flow.MutableStateFlow(emptyMap<String, app.resound.devices.driver.DeviceStatusModel>()) }).collectAsStateWithLifecycle()
+    val experiences by (inputs?.deviceExperiences ?: remember { kotlinx.coroutines.flow.MutableStateFlow(emptyMap<String,app.resound.devices.DeviceExperience>()) }).collectAsStateWithLifecycle()
+    val discoveredAt by (inputs?.discoverySeenAt ?: remember { kotlinx.coroutines.flow.MutableStateFlow(emptyMap<String,Long>()) }).collectAsStateWithLifecycle()
+    val plugins = remember { app.resound.devices.android.DriverCatalog.registered().map { it.driver.meta } }
+    fun metaFor(cardId: String): app.resound.devices.driver.DriverMeta? = plugins.firstOrNull { it.id == cardId }
+        ?: installed.firstOrNull { it.card.id == cardId }?.card?.let { card ->
+            app.resound.devices.driver.DriverMeta("card:${card.id}", app.resound.devices.driver.DriverTier.Card,
+                if (card.status == CardStatus.Trial) app.resound.devices.driver.Stability.Trial else app.resound.devices.driver.Stability.Stable,
+                app.resound.devices.driver.LocalizedText(card.name))
+        }
     var scanning by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<String?>(null) }
     var showCards by remember { mutableStateOf(false) }
@@ -61,7 +76,7 @@ fun DeviceSection(devices: Devices, cards: DeviceCards, scanError: kotlinx.corou
         val granted = needed.all { androidx.core.content.ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED }
         if (granted) { devices.startScan(); scanning = true } else ask.launch(needed)
     }
-    val enabledCards = installed.count { it.enabled }
+    val enabledCards = installed.count { it.enabled } + plugins.size
     Section("专用录音设备", trailing = {
         Text(if (scanning) "停止" else "搜索", style = RsType.subhead, color = c.accent,
             modifier = Modifier.springClick { if (scanning) { devices.stopScan(); scanning = false } else scan() })
@@ -69,14 +84,14 @@ fun DeviceSection(devices: Devices, cards: DeviceCards, scanError: kotlinx.corou
         RsCard(Modifier.animateContentSize(), padding = PaddingValues(vertical = 4.dp)) {
             paired.forEachIndexed { i, d ->
                 if (i > 0) Divider64()
-                PairedRow(d) { detail = d.address }
+                PairedRow(d, cached[d.address],experiences[d.address]) { detail = d.address }
             }
             if (scanning || found.isNotEmpty()) {
                 if (paired.isNotEmpty()) Divider64()
                 ScanHeader(scanning, found.isEmpty())
                 found.filter { f -> paired.none { it.address == f.address } }.forEach { f ->
                     Divider64()
-                    FoundRow(f) { devices.pair(f) }
+                    FoundRow(f,discoveredAt[f.address]) { devices.pair(f) }
                 }
             }
             if (paired.isEmpty() && !scanning && found.isEmpty()) {
@@ -93,6 +108,21 @@ fun DeviceSection(devices: Devices, cards: DeviceCards, scanError: kotlinx.corou
         }
         AnimatedVisibility(showCards) {
             RsCard(Modifier.padding(top = 8.dp), padding = PaddingValues(vertical = 4.dp)) {
+                plugins.forEachIndexed { i, m ->
+                    if (i > 0) Divider64()
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Glyph("驱", if (m.stability == app.resound.devices.driver.Stability.Stable) Color(0xFF3F8F6F) else c.warning)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(m.name.zh, style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text)
+                                if (m.stability == app.resound.devices.driver.Stability.Trial) { Spacer(Modifier.width(6.dp)); Tag("试用", c.warning) }
+                            }
+                            Text("社区适配" + (m.maintainer?.let { " · 维护人 $it" } ?: "") + "；搜索到就能配对", style = RsType.caption, color = c.textTertiary)
+                        }
+                    }
+                }
+                if (plugins.isNotEmpty() && installed.isNotEmpty()) Divider64()
                 installed.forEachIndexed { i, ic ->
                     if (i > 0) Divider64()
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -109,14 +139,15 @@ fun DeviceSection(devices: Devices, cards: DeviceCards, scanError: kotlinx.corou
                         app.resound.ui.skills.Toggle(ic.enabled) { cards.setEnabled(ic.card.id, it) }
                     }
                 }
-                if (installed.isEmpty()) Text("暂时没有可用的设备类型", style = RsType.subhead, color = c.textTertiary,
+                if (installed.isEmpty() && plugins.isEmpty()) Text("暂时没有可用的设备类型", style = RsType.subhead, color = c.textTertiary,
                     modifier = Modifier.padding(16.dp))
             }
         }
     }
+    if (showCards && app.resound.AppGraph.isDevicesReady) CaptureTools()
     detail?.let { address ->
         val d = paired.firstOrNull { it.address == address } ?: run { detail = null; return }
-        DeviceSheet(d, onForget = { devices.forget(d.address); detail = null }) { detail = null }
+        DeviceDetailSheet(d, inputs, metaFor(d.cardId), onForget = { devices.forget(d.address); detail = null }) { detail = null }
     }
 }
 
@@ -150,20 +181,26 @@ private fun DeviceStatus.tint(): Color = when (this) {
 }
 
 @Composable
-private fun PairedRow(d: DeviceState, onClick: () -> Unit) {
+private fun PairedRow(d: DeviceState, status: app.resound.devices.driver.DeviceStatusModel?, experience: app.resound.devices.DeviceExperience?, onClick: () -> Unit) {
     val c = Rs.colors
     Row(Modifier.fillMaxWidth().springClick(onClick).padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Glyph("设", d.status.tint())
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(d.name, style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text, maxLines = 1)
-            Text(d.lastError ?: d.statusLine(), style = RsType.caption, color = if (d.lastError != null) c.warning else c.textTertiary, maxLines = 2)
+            Text(d.lastError ?: experience?.activity?.text() ?: d.statusLine(), style = RsType.caption, color = if (d.lastError != null) c.warning else c.textTertiary, maxLines = 2)
             d.backfill?.takeIf { it.bytes > 0 }?.let { b ->
                 LinearProgressIndicator(progress = { (b.doneBytes.toFloat() / b.bytes).coerceIn(0f, 1f) }, color = c.accent, trackColor = c.accentSoft,
                     modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(4.dp).clip(CircleShape))
             }
         }
-        d.battery?.let { Text("$it%", style = RsType.subhead, color = if (it <= 15) c.critical else c.textSecondary) }
+        val parts = status?.batteries.orEmpty().sortedBy { it.part }
+        if (parts.size > 1) Column(horizontalAlignment = Alignment.End) {
+            parts.take(2).forEach { p ->
+                Text((if (p.part == 1) "" else "盒 ") + (p.percent?.let { "$it%" } ?: "—"), style = RsType.caption,
+                    color = if ((p.percent ?: 100) <= 15) c.critical else c.textSecondary)
+            }
+        } else d.battery?.let { Text("$it%", style = RsType.subhead, color = if (it <= 15) c.critical else c.textSecondary) }
     }
 }
 
@@ -180,7 +217,7 @@ private fun ScanHeader(scanning: Boolean, empty: Boolean) {
 }
 
 @Composable
-private fun FoundRow(f: FoundDevice, onPair: () -> Unit) {
+private fun FoundRow(f: FoundDevice, seenAt: Long?, onPair: () -> Unit) {
     val c = Rs.colors
     var pairing by remember { mutableStateOf(false) }
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -192,28 +229,57 @@ private fun FoundRow(f: FoundDevice, onPair: () -> Unit) {
                 if (f.trial) { Spacer(Modifier.width(6.dp)); Tag("试用", c.warning) }
             }
             f.rssi?.let { Text(if (it > -60) "就在旁边" else if (it > -80) "附近" else "有点远", style = RsType.caption, color = c.textTertiary) }
+            agoText(seenAt)?.let { Text("最近发现：$it；可见不代表可以连接",style = RsType.caption,color = c.textTertiary) }
         }
         Pill(if (pairing) "配对中" else "配对", filled = !pairing) { if (!pairing) { pairing = true; onPair() } }
     }
 }
 
+/** 卡 144 开发者工具：记录设备与手机之间的蓝牙通信（录包），供贡献者做回放测试 */
 @Composable
-private fun DeviceSheet(d: DeviceState, onForget: () -> Unit, onDismiss: () -> Unit) {
+private fun CaptureTools() {
     val c = Rs.colors
-    var confirm by remember { mutableStateOf(false) }
-    RsSheet(d.name, d.statusLine() + (d.battery?.let { " · 电量 $it%" } ?: ""), onDismiss = onDismiss) {
-        d.lastError?.let { Text(it, style = RsType.subhead, color = c.warning) }
-        d.backfill?.let { b ->
-            Text("正在补传断开期间的录音：${b.doneFiles}/${b.files} 个文件", style = RsType.subhead, color = c.text)
-            if (b.bytes > 0) LinearProgressIndicator(progress = { (b.doneBytes.toFloat() / b.bytes).coerceIn(0f, 1f) }, color = c.accent,
-                trackColor = c.accentSoft, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clip(CircleShape))
-            Text("补完、确认存好后才会删设备里的文件。", style = RsType.caption, color = c.textTertiary)
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val platform = app.resound.AppGraph.devicePlatform
+    var enabled by remember { mutableStateOf(platform.captureEnabled) }
+    var files by remember { mutableStateOf(emptyList<app.resound.devices.android.DeviceCaptureFile>()) }
+    var tick by remember { mutableStateOf(0) }
+    LaunchedEffect(tick, enabled) { files = runCatching { platform.listCaptures() }.getOrDefault(emptyList()) }
+    Column(Modifier.padding(start = 4.dp, end = 4.dp, top = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("开发者", style = RsType.subhead.copy(fontWeight = FontWeight.SemiBold), color = c.textSecondary)
+    }
+    RsCard(Modifier.padding(top = 8.dp), padding = PaddingValues(vertical = 4.dp)) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("记录蓝牙通信", style = RsType.body.copy(fontWeight = FontWeight.SemiBold), color = c.text)
+                Text("给适配设备的开发者用；重新连接设备后生效。录下的内容可能含声音，分享前请自己确认。", style = RsType.caption, color = c.textTertiary)
+            }
+            app.resound.ui.skills.Toggle(enabled) { platform.captureEnabled = it; enabled = it }
         }
-        Text("要用它录音，到上面“录音输入”里点它。", style = RsType.caption, color = c.textTertiary)
-        ActionButton(if (confirm) "确定忘记？再点一次" else "忘记这台设备", ActionKind.Danger) {
-            if (!confirm) { confirm = true; return@ActionButton }
-            onForget()
+        files.forEach { f ->
+            Divider64()
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(f.name, style = RsType.subhead, color = c.text, maxLines = 1)
+                    Text((if (f.active) "正在记录 · " else "") + "${(f.bytes + 1023) / 1024} KB · ${agoText(f.modifiedAtMillis)}", style = RsType.caption, color = c.textTertiary)
+                }
+                Pill("分享", filled = false) {
+                    scope.launch {
+                        runCatching {
+                            val file = platform.exportCapture(f.name)
+                            val uri = androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".files", file)
+                            context.startActivity(android.content.Intent.createChooser(android.content.Intent(android.content.Intent.ACTION_SEND)
+                                .setType("text/plain").putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION), "分享录包"))
+                        }
+                    }
+                }
+                if (!f.active) {
+                    Spacer(Modifier.width(8.dp))
+                    Pill("删除", filled = false) { scope.launch { runCatching { platform.deleteCapture(f.name) }; tick++ } }
+                }
+            }
         }
-        Text("忘记后不再自动连接；系统蓝牙里的配对不受影响。", style = RsType.caption, color = c.textTertiary)
     }
 }

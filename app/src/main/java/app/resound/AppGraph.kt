@@ -13,6 +13,20 @@ import app.resound.transcribe.TranscriptRepository
  * 底层实现完成前，界面用 ui/preview 里的假数据开发。
  */
 object AppGraph {
+    lateinit var marks: app.resound.marks.MarkRepository
+    lateinit var markSettings: app.resound.marks.AndroidMarkSettings
+    lateinit var platform: app.resound.platform.PlatformServices
+    val isPlatformReady: Boolean get() = ::platform.isInitialized
+
+    lateinit var quickPrefs: app.resound.quick.QuickPrefs
+    val isQuickPrefsReady: Boolean get() = ::quickPrefs.isInitialized
+    lateinit var health: app.resound.health.HealthCheck
+    val isHealthReady: Boolean get() = ::health.isInitialized
+    val settingsSearch: app.resound.settingsearch.SettingsSearch = app.resound.settingsearch.DefaultSettingsSearch()
+    /** 设置搜索是纯 Kotlin 对象，始终可用 */
+    val isSettingsSearchReady: Boolean get() = true
+
+    internal lateinit var devicePlatform: app.resound.devices.android.AndroidDevicePlatform
     lateinit var devices: app.resound.devices.Devices
     lateinit var deviceScanError: kotlinx.coroutines.flow.StateFlow<String?>
     lateinit var deviceCards: app.resound.devices.DeviceCards
@@ -25,6 +39,7 @@ object AppGraph {
     val isLlmProvidersReady: Boolean get() = ::llmProviders.isInitialized
     lateinit var topics: app.resound.topic.TopicRepository
     val isTopicsReady: Boolean get() = ::topics.isInitialized
+    val isMarksReady: Boolean get() = ::marks.isInitialized && ::markSettings.isInitialized
     lateinit var asrSpeed: app.resound.transcribe.AsrSpeedSettings
     lateinit var llmBalance: app.resound.usage.LlmBalanceChecker
     val isLlmBalanceReady: Boolean get() = ::llmBalance.isInitialized
@@ -56,6 +71,9 @@ object AppGraph {
     val isRedoReady: Boolean get() = ::redo.isInitialized
 
     // 卡 070：环境音识别
+    lateinit var nightInsights: app.resound.night.NightInsights
+    lateinit var night: app.resound.night.NightRepository
+    val isNightReady: Boolean get() = ::night.isInitialized
     lateinit var envSound: app.resound.envsound.EnvSoundRepository
     val isEnvSoundReady: Boolean get() = ::envSound.isInitialized
     /** 足迹（全天定位） */
@@ -67,6 +85,21 @@ object AppGraph {
     lateinit var situation: app.resound.context.SituationLookup
     val isSituationReady: Boolean get() = ::situation.isInitialized
     val isLocationReady: Boolean get() = ::location.isInitialized
+
+    /** 「记录播放标题」开关（默认关）。 */
+    lateinit var playbackTitleSettings: app.resound.screentime.PlaybackTitleSettings
+    val isPlaybackTitleReady: Boolean get() = ::playbackTitleSettings.isInitialized
+    /** 只读播放记录；为 null 时整理外放标注不匹配标题。 */
+    @Volatile var playbackQueries: app.resound.screentime.PlaybackQueries? = null
+    /** 设备播放记录接收方；为 null 时通知监听服务丢弃回调。 */
+    @Volatile var playbackSink: app.resound.screentime.PlaybackSink? = null
+
+    /** 屏幕时间采集开关（默认关）；只管屏幕事件，不影响播放记录。 */
+    lateinit var screenTimeSettings: app.resound.screentime.ScreenTimeSettings
+    lateinit var screenTimePuller: app.resound.screentime.ScreenTimePuller
+    val isScreenTimeReady: Boolean get() = ::screenTimeSettings.isInitialized && ::screenTimePuller.isInitialized
+    /** 屏幕时间读取入口；为 null 时消费方按总开关关闭处理。 */
+    @Volatile var screenTimeReader: app.resound.screentime.ScreenTimeReader? = null
 
     // 卡 079：寻物
     lateinit var things: app.resound.things.ThingRepository
@@ -106,8 +139,15 @@ object AppGraph {
     lateinit var digestProgress: kotlinx.coroutines.flow.StateFlow<app.resound.digest.DigestProgress>
     val isDigestProgressReady: Boolean get() = ::digestProgress.isInitialized
 
-    lateinit var playbackSkip: app.resound.capture.PlaybackSkipSettings
-    val isPlaybackSkipReady: Boolean get() = ::playbackSkip.isInitialized
+    lateinit var playbackSentences: app.resound.transcribe.PlaybackSentences
+    lateinit var playbackSettings: app.resound.transcribe.PlaybackSettings
+    lateinit var playbackSkip: app.resound.capture.LegacyPlaybackControls
+    val playbackDigestSettings get() = playbackSkip
+    val isPlaybackSkipReady get() = ::playbackSkip.isInitialized
+    val isPlaybackDigestReady get() = isPlaybackSkipReady
+
+    /** 播放状态（是否在放、是否可能外放）应用级单例；有订阅者才注册系统回调。 */
+    lateinit var playback: app.resound.capture.PlaybackMonitor
 
 
     lateinit var review: app.resound.review.ReviewRepository
@@ -122,6 +162,8 @@ object AppGraph {
     lateinit var importKinds: app.resound.importer.ImportKinds
     val isImportKindsReady: Boolean get() = ::importKinds.isInitialized
     lateinit var folderImports: app.resound.importer.FolderImports
+    lateinit var folderRecordings: app.resound.importer.FolderRecordings
+    val isCallRecordingReady: Boolean get() = ::folderRecordings.isInitialized
     val isFolderImportReady: Boolean get() = ::folderImports.isInitialized
     lateinit var importer: app.resound.importer.AudioImporter
     val isImporterReady: Boolean get() = ::importer.isInitialized
@@ -147,6 +189,7 @@ object AppGraph {
 
     lateinit var memory: MemoryRepository
     lateinit var digestSettings: DigestSettings
+    val isDigestSettingsReady: Boolean get() = ::digestSettings.isInitialized
 
     lateinit var ask: app.resound.ask.AskRepository
     val isAskReady: Boolean get() = ::ask.isInitialized
